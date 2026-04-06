@@ -5,6 +5,7 @@ package ringbuffer
 
 import (
 	"runtime"
+	"sync/atomic"
 )
 
 const cacheLinePad = 64 // 缓存行大小，避免 false sharing
@@ -27,7 +28,7 @@ type RingBuffer[T any] struct {
 	data []T
 }
 
-// New 创建容量为 2^n 的 RingBuffer（capacity 自动向上取整为 2 的幂）
+// New 创建容量为 2^n 的 RingBuffer（capacity 向上取整为 2 的幂）
 func New[T any](capacity uint64) *RingBuffer[T] {
 	cap := roundUpPow2(capacity)
 	return &RingBuffer[T]{
@@ -50,4 +51,55 @@ func roundUpPow2(v uint64) uint64 {
 	v |= v >> 32
 	v++
 	return v
+}
+
+// Enqueue 生产者入队（非阻塞）
+func (rb *RingBuffer[T]) Enqueue(v T) bool {
+	head := atomic.LoadUint64(&rb.head.val)
+	tail := atomic.LoadUint64(&rb.tail.val)
+
+	// 判断是否已满
+	if tail-head == rb.capacity {
+		return false
+	}
+
+	// 写入数据
+	rb.data[head&rb.mask] = v
+
+	// 更新 tail 指针
+	atomic.StoreUint64(&rb.tail.val, tail+1)
+	runtime.Gosched()
+	return true
+}
+
+// Dequeue 消费者出队（非阻塞）
+func (rb *RingBuffer[T]) Dequeue() (T, bool) {
+	head := atomic.LoadUint64(&rb.head.val)
+	tail := atomic.LoadUint64(&rb.tail.val)
+
+	var zero T
+
+	if head == tail {
+		return zero, false
+	}
+
+	idx := tail & rb.mask
+
+	// 读取数据
+	v := rb.data[idx]
+
+	// 释放引用，避免内存泄漏
+	rb.data[idx] = zero
+
+	// 更新 tail 指针
+	atomic.StoreUint64(&rb.tail.val, tail+1)
+	runtime.Gosched()
+	return v, true
+}
+
+// Len 获取环形缓冲区长度（非阻塞）
+func (rb *RingBuffer[T]) Len() uint64 {
+	head := atomic.LoadUint64(&rb.head.val)
+	tail := atomic.LoadUint64(&rb.tail.val)
+	return tail - head
 }
