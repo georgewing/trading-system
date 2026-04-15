@@ -12,8 +12,12 @@ trading-system/
 │   ├── config.example.yaml
 │   └── ...
 ├── deployments/
-│   ├── docker-compose.yaml      # 可选：postgres+timescale、clickhouse、redis
-│   └── ...
+│   ├── k8s/                    # Kubernetes 完整部署（Deployment + Service + HPA + Istio）
+│   │   ├── order-service/
+│   │   ├── market-service/
+│   │   ├── risk-service/
+│   │   └── helm/               # Helm chart
+│   └── .docker-compose.yaml      # 可选：postgres+timescale、clickhouse、redis
 ├── internal/
 │   ├── app/                     # 组装：依赖注入、生命周期、配置加载
 │   │   ├── app.go

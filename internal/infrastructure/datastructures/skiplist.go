@@ -19,7 +19,7 @@ type PriceLevel struct {
 }
 
 // SkipList 实现价格档位的有序存储（升序排列）
-type Skiplist struct {
+type SkipList struct {
 	header *PriceLevel
 	level  int
 	length int
@@ -28,8 +28,8 @@ type Skiplist struct {
 }
 
 // NewSkiplist 创建一个新的 SkipList
-func NewSkiplist() *Skiplist {
-	return &Skiplist{
+func NewSkipList() *SkipList {
+	return &SkipList{
 		header: &PriceLevel{
 			forward: make([]*PriceLevel, maxLevel),
 		},
@@ -39,16 +39,16 @@ func NewSkiplist() *Skiplist {
 }
 
 // randomLevel 生成随机层高（概率递减）
-func (sl *Skiplist) randomLevel() int {
+func (sl *SkipList) randomLevel() int {
 	level := 0
-	for level < maxLevel && sl.rand.Float64() < probability {
+	for level < maxLevel-1 && sl.rand.Float64() < probability {
 		level++
 	}
 	return level
 }
 
-// Add 增加指定价格档位的数量（qty为正数）
-func (sl *Skiplist) Add(price, qty int64) {
+// Add 增加指定价格档位的数量（支持相同价格累加）
+func (sl *SkipList) Add(price, qty int64) {
 	// 若价格已存在，则累加数量；若qty <=0，则忽略
 	if qty <= 0 {
 		return
@@ -88,7 +88,7 @@ func (sl *Skiplist) Add(price, qty int64) {
 		forward: make([]*PriceLevel, newLevel),
 	}
 
-	for i := 0; i < newLevel; i++ {
+	for i := 0; i <= newLevel; i++ {
 		n.forward[i] = update[i].forward[i]
 		update[i].forward[i] = n
 	}
@@ -96,7 +96,7 @@ func (sl *Skiplist) Add(price, qty int64) {
 }
 
 // Remove 扣减数量
-func (sl *Skiplist) Remove(price, qty int64) {
+func (sl *SkipList) Remove(price, qty int64) {
 	if qty <= 0 {
 		return
 	}
@@ -121,9 +121,10 @@ func (sl *Skiplist) Remove(price, qty int64) {
 		// 扣减后 <= 0 则自动删除档位
 		if target.Qty <= 0 {
 			for i := 0; i <= sl.level; i++ {
-				if update[i].forward[i] == target {
-					update[i].forward[i] = target.forward[i]
+				if update[i].forward[i] != target {
+					break
 				}
+				update[i].forward[i] = target.forward[i]
 			}
 
 			for sl.level > 0 && sl.header.forward[sl.level] == nil {
@@ -135,7 +136,7 @@ func (sl *Skiplist) Remove(price, qty int64) {
 }
 
 // Get 返回指定价格的剩余数量（不存在返回 0）
-func (sl *Skiplist) Get(price int64) int64 {
+func (sl *SkipList) Get(price int64) int64 {
 	sl.mutex.RLock()
 	defer sl.mutex.RUnlock()
 
@@ -152,16 +153,60 @@ func (sl *Skiplist) Get(price int64) int64 {
 	return 0
 }
 
-// best bid/ask
-func (sl *Skiplist) Best(price float64, qty float64) bool {
+// Max 返回最高价格档位（Bid 侧最佳）
+func (sl *SkipList) Max() (*PriceLevel, bool) {
+	sl.mutex.RLock()
+	defer sl.mutex.RUnlock()
+	if sl.header.forward[0] == nil {
+		return nil, false
+	}
 
+	current := sl.header
+	for i := sl.level; i >= 0; i-- {
+		for current.forward[i] != nil {
+			current = current.forward[i]
+		}
+	}
+	return current, true
 }
 
-type Iterate struct {
+// Min 返回最低价格档位（Ask 侧最佳）
+func (sl *SkipList) Min() (*PriceLevel, bool) {
+	sl.mutex.RLock()
+	defer sl.mutex.RUnlock()
+	if sl.header.forward[0] == nil {
+		return nil, false
+	}
+	return sl.header.forward[0], true
+}
+
+// best bid/ask
+// isBid = true  → 返回最高价（最佳买价）
+// isBid = false → 返回最低价（最佳卖价）
+func (sl *SkipList) Best(isBid bool) (*PriceLevel, bool) {
+	if isBid {
+		return sl.Max()
+	}
+	return sl.Min()
+}
+
+type Iterator struct {
 	current *PriceLevel
 }
 
+func (it *Iterator) Next() bool {
+	if it.current.forward[0] == nil {
+		return false
+	}
+	it.current = it.current.forward[0]
+	return true
+}
+
+func (it *Iterator) Current() *PriceLevel {
+	return it.current
+}
+
 // 用于生成 depth/market-by-price
-func (sl *Skiplist) Iterate() Iterate {
-	return Iterate{current: sl.header}
+func (sl *SkipList) Iterate() Iterator {
+	return Iterator{current: sl.header}
 }
