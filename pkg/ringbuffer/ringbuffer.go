@@ -4,7 +4,6 @@
 package ringbuffer
 
 import (
-	"runtime"
 	"sync/atomic"
 )
 
@@ -64,11 +63,10 @@ func (rb *RingBuffer[T]) Enqueue(v T) bool {
 	}
 
 	// 写入数据
-	rb.data[head&rb.mask] = v
+	rb.data[tail&rb.mask] = v
 
 	// 更新 tail 指针
 	atomic.StoreUint64(&rb.tail.val, tail+1)
-	runtime.Gosched()
 	return true
 }
 
@@ -83,17 +81,15 @@ func (rb *RingBuffer[T]) Dequeue() (T, bool) {
 		return zero, false
 	}
 
-	idx := tail & rb.mask
+	idx := head & rb.mask
 
 	// 读取数据
 	v := rb.data[idx]
 
-	// 释放引用，避免内存泄漏
+	// 释放引用，避免GC内存泄漏
 	rb.data[idx] = zero
 
-	// 更新 tail 指针
-	atomic.StoreUint64(&rb.tail.val, tail+1)
-	runtime.Gosched()
+	atomic.StoreUint64(&rb.head.val, head+1)
 	return v, true
 }
 
