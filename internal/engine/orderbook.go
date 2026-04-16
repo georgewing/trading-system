@@ -12,10 +12,12 @@ import (
 )
 
 type Order struct {
-	ID       string
-	Side     string
-	Price    float64
-	Quantity string
+	ID          string
+	Side        string
+	Price       float64
+	Quantity    string
+	Type        OrderType
+	TimeInForce TimeInForce
 	// 可根据业务扩展：ClientID, OrderType, TimeInForce 等
 }
 
