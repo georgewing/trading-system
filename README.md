@@ -25,12 +25,12 @@ trading-system/
 │   ├── engine/                  # 领域模型 + 内存撮合/订单簿（若有）
 │   │   ├── types.go
 │   │   ├── orderbook.go         # 可选
-│   │   └── matcher.go           # 可选
+│   │   └── matcher.go           # 撮合引擎
 │   ├── gateway/                 # 交易所适配：行情 WS、交易 REST/WS
 │   │   ├── market/              # 解码、订阅、重连
 │   │   └── execution/           # 下单、撤单、查询
 │   ├── pipeline/                # RingBuffer / 事件总线 / worker 池
-│   │   └── bus.go
+│   │   └── bus.go               # 事件消费 worker
 │   ├── risk/                    # 事前/事中规则
 │   │   └── guard.go
 │   ├── strategy/                # 策略接口与示例（回测与实盘共用接口）
@@ -45,7 +45,7 @@ trading-system/
 │   └── observability/           # metrics、tracing、logging 封装
 │       └── ...
 ├── pkg/
-│   ├── ringbuffer/              # 已有
+│   ├── ringbuffer/              # 基于 LMAX Disruptor 思想的无锁SPSC
 │   ├── protocol/                # 可选：与前端/策略的二进制或 JSON 契约
 │   └── idgen/
 ├── migrations/                  # SQL 迁移（推荐 golang-migrate 或 goose）
