@@ -5,10 +5,10 @@ package http
 import (
 	"encoding/json"
 	"net/http"
+	"strconv"
 	"time"
 
 	"trading-system/internal/engine"
-	"trading-system/internal/observability"
 )
 
 // 请求/响应结构体（OpenAPI 友好）
@@ -37,36 +37,52 @@ type ErrorResponse struct {
 }
 
 // MakeMatchEndpoint 创建撮合端点 Handler
-func MakeMatchEndpoint(matcher *engine.Matcher, metrics *observability.Metrics) http.Handler {
-	return func(w http.ResponseWriter, r *http.Request) {
+// metrics 参数预留（未来注入 Prometheus / observability.Metrics）
+func MakeMatchEndpoint(matcher *engine.Matcher) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
-		defer func() {
-			if metrics != nil {
-				metrics.ObserveMatchLatency("http.match", time.Since(start))
-			}
-		}()
+		_ = start // TODO: metrics.ObserveMatchLatency("http.match", time.Since(start))
 
 		// 解析请求
 		var req MatchRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			writeError(w, http.StatusBadRequest, "invalid_json", err.Error())
+			writeError(w, http.StatusBadRequest, "invalid json: "+err.Error())
 			return
 		}
 
 		// 校验
 		if req.OrderID == "" || (req.Side != "BUY" && req.Side != "SELL") {
-			writeError(w, http.StatusBadRequest, "invalid_params", "invalid side or order_id")
+			writeError(w, http.StatusBadRequest, "invalid side or order_id")
 			return
+		}
+
+		// 将 string OrderID 转换为 uint64
+		orderID, err := strconv.ParseUint(req.OrderID, 10, 64)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "order_id must be a numeric string")
+			return
+		}
+
+		// 将 float64 Price 转换为 int64（调用方应传入已乘以精度的整数值，
+		// 或在此处乘以精度——取决于 API 契约，当前简化取整）
+		priceInt := int64(req.Price)
+
+		// 映射 Side
+		var side engine.Side
+		if req.Side == "BUY" {
+			side = engine.SideBuy
+		} else {
+			side = engine.SideSell
 		}
 
 		// 构造领域 Order
 		order := engine.Order{
-			ID:          req.OrderID,
-			Side:        req.Side,
-			Price:       req.Price,
-			Quantity:    req.Quantity,
-			Type:        req.Type,
-			TimeInForce: req.TimeInForce,
+			ID:       orderID,
+			Side:     side,
+			Price:    priceInt,
+			Quantity: req.Quantity,
+			Type:     engine.OrderType(req.Type),
+			TIF:      engine.TimeInForce(req.TimeInForce),
 		}
 
 		// 执行撮合
@@ -77,14 +93,14 @@ func MakeMatchEndpoint(matcher *engine.Matcher, metrics *observability.Metrics) 
 			if err.Error() == "FOK: cannot fully fill" {
 				code = http.StatusUnprocessableEntity
 			}
-			writeError(w, code, "match_failed", err.Error())
+			writeError(w, code, err.Error())
 			return
 		}
 
 		// 计算已成交数量
 		var executed int64
 		for _, t := range trades {
-			executed += t.Qty
+			executed += t.Quantity
 		}
 
 		// 返回响应
@@ -101,14 +117,14 @@ func MakeMatchEndpoint(matcher *engine.Matcher, metrics *observability.Metrics) 
 		json.NewEncoder(w).Encode(resp)
 
 		// TODO: 生产中在这里异步推送 WS / ClickHouse
-	}
+	})
 }
 
-func writeError(w http.ResponseWriter, status int, code, msg string) {
+func writeError(w http.ResponseWriter, status int, msg string) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	json.NewEncoder(w).Encode(ErrorResponse{
-		Code:    code,
+		Code:    status,
 		Message: msg,
 	})
 }

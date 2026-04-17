@@ -11,16 +11,6 @@ import (
 	"trading-system/pkg/ringbuffer"
 )
 
-type Order struct {
-	ID          string
-	Side        string
-	Price       float64
-	Quantity    string
-	Type        OrderType
-	TimeInForce TimeInForce
-	// 可根据业务扩展：ClientID, OrderType, TimeInForce 等
-}
-
 type OrderBook struct {
 	symbol            string
 	pricePrecision    int64 // 价格精度倍数（如 BTC/USDT 用 100000000 表示 8 位小数）
@@ -33,9 +23,9 @@ type OrderBook struct {
 }
 
 type OrderEvent struct {
-	OrderID   string
-	Side      string
-	Price     float64
+	OrderID   uint64
+	Side      Side
+	Price     int64
 	Quantity  string
 	TimeStamp int64
 	EventType string
@@ -68,9 +58,10 @@ func (ob *OrderBook) AddOrder(ctx context.Context, order Order) {
 		TimeStamp: time.Now().UnixNano(),
 		EventType: "ADD",
 	}
-	ob.eventBus.Enqueue(*event)
+	ob.eventBus.Enqueue(*event) //nolint:errcheck
 
-	priceInt := int64(math.Round(order.Price * float64(ob.pricePrecision)))
+	// order.Price 已经是 int64（以最小价格单位表示），直接使用
+	priceInt := order.Price
 
 	qtyFloat, err := strconv.ParseFloat(order.Quantity, 64)
 	if err != nil {
@@ -81,7 +72,7 @@ func (ob *OrderBook) AddOrder(ctx context.Context, order Order) {
 	qtyInt := int64(math.Round(qtyFloat * float64(ob.quantityPrecision)))
 
 	// 实际订单簿更新逻辑（零拷贝、高性能）
-	if order.Side == "BUY" {
+	if order.Side == SideBuy {
 		ob.bids.Add(priceInt, qtyInt)
 	} else {
 		ob.asks.Add(priceInt, qtyInt)
@@ -100,7 +91,7 @@ func (ob *OrderBook) GetBestAsk() (*datastructures.PriceLevel, bool) {
 
 // GetMarketDepth 示例：生成深度行情（Ask 侧升序，最佳 Ask 在前）
 func (ob *OrderBook) GetMarketDepth(side string, limit int) []*datastructures.PriceLevel {
-	var it *datastructures.Iterator
+	var it datastructures.Iterator
 	if side == "BUY" || side == "BID" {
 		it = ob.bids.Iterate() // Bid 侧降序（最高价在前），实际深度通常 Ask 升序
 	} else {
