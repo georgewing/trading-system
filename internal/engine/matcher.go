@@ -30,6 +30,15 @@ type Matcher struct {
 	// metrics   *observability.Metrics // 未来注入 Prometheus
 }
 
+// SubmitResult表示一次提交后的最终执行结果（供 execution report 使用）。
+type SubmitResult struct {
+	Trades      []Trade
+	ExecutedQty int64
+	OpenLeaves  int64
+	CanceledQty int64 // 被策略取消的量（IOC/MARKET 可能 >0）
+	FinalStatus OrderStatus
+}
+
 func NewMatcher(ob *OrderBook) *Matcher {
 	return &Matcher{
 		ob:           ob,
@@ -82,14 +91,24 @@ func (m *Matcher) Match(ctx context.Context, order Order) ([]Trade, int64, error
 			// 生成成交记录
 			tradeID, _ := strconv.ParseUint(generateTradeID(&m.tradeSeq)[2:], 10, 64)
 			trade := Trade{
-				ID:          tradeID,
-				Symbol:      m.ob.symbol,
-				Price:       best.Price,
-				Quantity:    fillQty,
-				BuyOrderID:  func() uint64 { if order.Side == SideBuy { return order.ID }; return 0 }(),
-				SellOrderID: func() uint64 { if order.Side == SideSell { return order.ID }; return 0 }(),
-				Timestamp:   time.Now().UnixNano(),
-				MakerOrder:  0, // 当前聚合模式无法精确对应 maker 订单ID，升级后填充
+				ID:       tradeID,
+				Symbol:   m.ob.symbol,
+				Price:    best.Price,
+				Quantity: fillQty,
+				BuyOrderID: func() uint64 {
+					if order.Side == SideBuy {
+						return order.ID
+					}
+					return 0
+				}(),
+				SellOrderID: func() uint64 {
+					if order.Side == SideSell {
+						return order.ID
+					}
+					return 0
+				}(),
+				Timestamp:  time.Now().UnixNano(),
+				MakerOrder: 0, // 当前聚合模式无法精确对应 maker 订单ID，升级后填充
 			}
 			trades = append(trades, trade)
 
@@ -109,11 +128,25 @@ func (m *Matcher) Match(ctx context.Context, order Order) ([]Trade, int64, error
 	return trades, remainingQty, nil
 }
 
+func sumExecutedQty(trades []Trade) int64 {
+	var n int64
+	for _, trade := range trades {
+		n += trade.Quantity
+	}
+	return n
+}
+
 // SubmitOrder 提交订单并执行撮合（生产主入口）
 func (m *Matcher) SubmitOrder(ctx context.Context, order Order) ([]Trade, error) {
 	trades, remainingQty, err := m.Match(ctx, order)
 	if err != nil {
 		return nil, err
+	}
+
+	executed := sumExecutedQty(trades)
+	result := &SubmitResult{
+		Trades:      trades,
+		ExecutedQty: executed,
 	}
 
 	// 处理剩余订单
@@ -122,7 +155,13 @@ func (m *Matcher) SubmitOrder(ctx context.Context, order Order) ([]Trade, error)
 		case order.Type == OrderTypeMarket || order.TIF == TimeInForceIOC:
 			// MARKET / IOC：剩余全部取消，不挂单
 			// 可在这里发布 Cancel 事件
-			return trades, nil
+			result.CanceledQty = remainingQty
+			if executed > 0 {
+				result.FinalStatus = OrderStatusPartiallyFilled
+			} else {
+				result.FinalStatus = OrderStatusCanceled
+			}
+			return result.Trades, nil
 		case order.TIF == TimeInForceFOK:
 			// FOK: 必须全部成交，否则整单拒绝并回滚已扣减的对侧订单簿
 			for _, t := range trades {
@@ -133,7 +172,7 @@ func (m *Matcher) SubmitOrder(ctx context.Context, order Order) ([]Trade, error)
 					m.ob.bids.Add(t.Price, t.Quantity)
 				}
 			}
-			return nil, errors.New("FOK: cannot fully fill")
+			return SubmitResult{}.Trades, errors.New("FOK: cannot fully fill")
 		default: // LIMIT + GTC → 剩余挂单
 			priceInt := order.Price
 			qtyInt := remainingQty
@@ -145,13 +184,24 @@ func (m *Matcher) SubmitOrder(ctx context.Context, order Order) ([]Trade, error)
 			}
 			// 保存 resting order（保留原始信息）
 			m.activeOrders[order.ID] = &order // 注意：实际生产建议深拷贝或只存必要字段 //nolint
+			result.OpenLeaves = remainingQty
+			if executed > 0 {
+				result.FinalStatus = OrderStatusPartiallyFilled
+			} else {
+				result.FinalStatus = OrderStatusNew
+			}
+
+			return result.Trades, nil
 		}
 	}
 
-	// TODO: 生产中在这里发布 Trade 事件到 eventBus / WS / ClickHouse
-	// m.ob.eventBus.Enqueue(TradeEvent{...})  或通过 callback
+	if executed > 0 {
+		result.FinalStatus = OrderStatusFilled
+	} else {
+		result.FinalStatus = OrderStatusNew
+	}
 
-	return trades, nil
+	return result.Trades, nil
 }
 
 // isCrossing 判断是否价格交叉

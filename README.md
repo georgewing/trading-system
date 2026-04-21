@@ -47,7 +47,7 @@ trading-system/
 ├── pkg/
 │   ├── ringbuffer/              # 基于 LMAX Disruptor 思想的无锁SPSC
 │   ├── protocol/                # 可选：与前端/策略的二进制或 JSON 契约
-│   └── idgen/
+│   └── idgen/                   # ID 生成器
 ├── migrations/                  # SQL 迁移（推荐 golang-migrate 或 goose）
 │   └── postgres/
 │       ├── 000001_init.up.sql
