@@ -2,109 +2,292 @@ package pipeline
 
 import (
 	"context"
+	"errors"
+	"log"
+	"sync"
+	"sync/atomic"
 	"time"
 	"trading-system/internal/engine"
 	"trading-system/pkg/ringbuffer"
 )
 
-// OrderCommand 是入站命令壳：承载引擎订单 + 可选结果回传 channel。
+var (
+	ErrInboundQueueFull  = errors.New("eventbus inbound queue full")
+	ErrOutboundQueueFull = errors.New("eventbus outbound queue full")
+)
+
 type OrderCommand struct {
-	Order engine.Order
-	// 可选：利用 channel 将异步撮合结果带回给 HTTP (仅限于同步请求响应模式，实盘通常靠 WS 异步推送)
+	Order    engine.Order
 	ResultCh chan<- MatchResult
 }
 
-// MatchResult 是单次 Submit 的撮合结果，供同步等待的调用方接收。
 type MatchResult struct {
 	Trades []engine.Trade
 	Err    error
+}
+
+type EventBusConfig struct {
+	InboundCapacity      uint64
+	OutboundCapacity     uint64
+	SubmitTimeout        time.Duration
+	ResultSendTimeout    time.Duration
+	ReportEnqueueTimeout time.Duration
+	IdleSleep            time.Duration
+	RetrySleep           time.Duration
+}
+
+func DefaultEventBusConfig() EventBusConfig {
+	return EventBusConfig{
+		InboundCapacity:      1 << 20,
+		OutboundCapacity:     1 << 20,
+		SubmitTimeout:        2 * time.Millisecond,
+		ResultSendTimeout:    10 * time.Millisecond,
+		ReportEnqueueTimeout: 5 * time.Millisecond,
+		IdleSleep:            50 * time.Microsecond,
+		RetrySleep:           20 * time.Microsecond,
+	}
 }
 
 type EventBus struct {
 	queue    *ringbuffer.RingBuffer[OrderCommand]
 	matcher  *engine.Matcher
 	outbound *ringbuffer.RingBuffer[engine.ExecReport]
+
+	cfg      EventBusConfig
+	submitMu sync.Mutex // ringbuffer 是 SPSC；多 producer 时必须保护 enqueue
+
+	droppedInbound  atomic.Uint64
+	droppedOutbound atomic.Uint64
 }
 
 func NewEventBus(matcher *engine.Matcher, capacity uint64) *EventBus {
+	cfg := DefaultEventBusConfig()
+	if capacity > 0 {
+		cfg.InboundCapacity = capacity
+		cfg.OutboundCapacity = capacity
+	}
+	return NewEventBusWithConfig(matcher, cfg)
+}
+
+func NewEventBusWithConfig(matcher *engine.Matcher, cfg EventBusConfig) *EventBus {
+	if cfg.InboundCapacity == 0 {
+		cfg.InboundCapacity = 1 << 20
+	}
+	if cfg.OutboundCapacity == 0 {
+		cfg.OutboundCapacity = 1 << 20
+	}
+	if cfg.SubmitTimeout <= 0 {
+		cfg.SubmitTimeout = 2 * time.Millisecond
+	}
+	if cfg.ResultSendTimeout <= 0 {
+		cfg.ResultSendTimeout = 10 * time.Millisecond
+	}
+	if cfg.ReportEnqueueTimeout <= 0 {
+		cfg.ReportEnqueueTimeout = 5 * time.Millisecond
+	}
+	if cfg.IdleSleep <= 0 {
+		cfg.IdleSleep = 50 * time.Microsecond
+	}
+	if cfg.RetrySleep <= 0 {
+		cfg.RetrySleep = 20 * time.Microsecond
+	}
+
 	return &EventBus{
-		queue:    ringbuffer.New[OrderCommand](capacity),
+		queue:    ringbuffer.New[OrderCommand](cfg.InboundCapacity),
 		matcher:  matcher,
-		outbound: ringbuffer.New[engine.ExecReport](capacity),
+		outbound: ringbuffer.New[engine.ExecReport](cfg.OutboundCapacity),
+		cfg:      cfg,
 	}
 }
 
-// Submit 供 HTTP/WS handler 调用，将订单压入无锁队列
+// 兼容旧接口
 func (b *EventBus) Submit(cmd OrderCommand) bool {
-	return b.queue.Enqueue(cmd)
+	return b.SubmitWithContext(context.Background(), cmd) == nil
 }
 
-// Outbound 返回执行回报出向队列，供 WS/存储 worker 消费
+func (b *EventBus) SubmitWithContext(ctx context.Context, cmd OrderCommand) error {
+	timer := time.NewTimer(b.cfg.SubmitTimeout)
+	defer stopTimer(timer)
+
+	for {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+
+		b.submitMu.Lock()
+		ok := b.queue.Enqueue(cmd)
+		b.submitMu.Unlock()
+		if ok {
+			return nil
+		}
+
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-timer.C:
+			b.droppedInbound.Add(1)
+			return ErrInboundQueueFull
+		default:
+			time.Sleep(b.cfg.RetrySleep)
+		}
+	}
+}
+
 func (b *EventBus) Outbound() *ringbuffer.RingBuffer[engine.ExecReport] {
 	return b.outbound
 }
 
-// Start 开启单线程消费 (撮合必须是单线程以避免锁竞争)
+func (b *EventBus) DroppedInbound() uint64 {
+	return b.droppedInbound.Load()
+}
+
+func (b *EventBus) DroppedOutbound() uint64 {
+	return b.droppedOutbound.Load()
+}
+
 func (b *EventBus) Start(ctx context.Context) {
 	go func() {
-
 		for {
 			select {
 			case <-ctx.Done():
 				return
 			default:
-				// 非阻塞队列
-				if cmd, ok := b.queue.Dequeue(); ok {
-					// 单线程无锁调用引擎
-					trades, err := b.matcher.SubmitOrder(ctx, cmd.Order)
-
-					// 如果 HTTP 在等结果，就通过 channel 发回去
-					if cmd.ResultCh != nil {
-						cmd.ResultCh <- MatchResult{Trades: trades, Err: err}
-					}
-
-					if b.outbound != nil {
-						//撮合失败：回报 REJECTED
-						if err != nil {
-							_ = b.outbound.Enqueue(engine.ExecReport{
-								OrderID:   cmd.Order.ID,
-								Status:    engine.OrderStatusRejected,
-								Reason:    err.Error(),
-								Timestamp: time.Now().UnixNano(),
-							})
-							continue
-						}
-
-						// 无成交：默认不发成交回报（可按业务改为 NEW/CANCELED）
-						if len(trades) == 0 {
-							continue
-						}
-
-						// 有成交：逐笔回报
-						var cumFilled int64
-						for i := range trades {
-							tr := trades[i]
-							cumFilled += tr.Quantity
-
-							status := engine.OrderStatusPartiallyFilled
-							if i == len(trades)-1 {
-								status = engine.OrderStatusFilled // 若有剩余挂单，后续可改为 PartiallyFilled
-							}
-
-							_ = b.outbound.Enqueue(engine.ExecReport{
-								OrderID:   cmd.Order.ID,
-								Status:    status,
-								Filled:    cumFilled,
-								Leaves:    0, // 需 matcher 返回 remainingQty 才能精确填
-								Trade:     &tr,
-								Timestamp: tr.Timestamp,
-							})
-						}
-					}
+				cmd, ok := b.queue.Dequeue()
+				if !ok {
+					time.Sleep(b.cfg.IdleSleep)
 					continue
+				}
 
+				result, matchErr := b.matcher.SubmitOrderDetailed(ctx, cmd.Order)
+
+				b.sendResult(ctx, cmd.ResultCh, MatchResult{
+					Trades: result.Trades,
+					Err:    matchErr,
+				})
+
+				reports := buildExecReports(cmd.Order, result, matchErr)
+				for _, report := range reports {
+					if err := b.enqueueReport(ctx, report); err != nil {
+						log.Printf("enqueue exec report failed: orderID=%d err=%v", report.OrderID, err)
+					}
 				}
 			}
 		}
 	}()
+}
+
+func (b *EventBus) sendResult(ctx context.Context, ch chan<- MatchResult, r MatchResult) {
+	if ch == nil {
+		return
+	}
+	timer := time.NewTimer(b.cfg.ResultSendTimeout)
+	defer stopTimer(timer)
+
+	select {
+	case ch <- r:
+	case <-ctx.Done():
+	case <-timer.C:
+		log.Printf("result channel blocked: drop response")
+	}
+}
+
+func (b *EventBus) enqueueReport(ctx context.Context, report engine.ExecReport) error {
+	if b.outbound == nil {
+		return nil
+	}
+
+	timer := time.NewTimer(b.cfg.ReportEnqueueTimeout)
+	defer stopTimer(timer)
+
+	for {
+		if b.outbound.Enqueue(report) {
+			return nil
+		}
+
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-timer.C:
+			b.droppedOutbound.Add(1)
+			return ErrOutboundQueueFull
+		default:
+			time.Sleep(b.cfg.RetrySleep)
+		}
+	}
+}
+
+func buildExecReports(order engine.Order, result engine.SubmitResult, matchErr error) []engine.ExecReport {
+	now := time.Now().UnixNano()
+
+	if matchErr != nil {
+		return []engine.ExecReport{
+			{
+				OrderID:   order.ID,
+				Status:    engine.OrderStatusRejected,
+				Filled:    0,
+				Leaves:    0,
+				Reason:    matchErr.Error(),
+				Timestamp: now,
+			},
+		}
+	}
+
+	if len(result.Trades) == 0 {
+		reason := ""
+		if result.CanceledQty > 0 {
+			reason = "remaining quantity canceled by order policy"
+		}
+		return []engine.ExecReport{
+			{
+				OrderID:   order.ID,
+				Status:    result.FinalStatus,
+				Filled:    0,
+				Leaves:    result.OpenLeaves,
+				Reason:    reason,
+				Timestamp: now,
+			},
+		}
+	}
+
+	reports := make([]engine.ExecReport, 0, len(result.Trades))
+	var cumFilled int64
+
+	for i := range result.Trades {
+		tr := result.Trades[i]
+		cumFilled += tr.Quantity
+
+		status := engine.OrderStatusPartiallyFilled
+		reason := ""
+		if i == len(result.Trades)-1 {
+			status = result.FinalStatus
+			if result.CanceledQty > 0 {
+				reason = "remaining quantity canceled by order policy"
+			}
+		}
+
+		trCopy := tr
+		reports = append(reports, engine.ExecReport{
+			OrderID:   order.ID,
+			Status:    status,
+			Filled:    cumFilled,
+			Leaves:    result.OpenLeaves,
+			Trade:     &trCopy,
+			Reason:    reason,
+			Timestamp: tr.Timestamp,
+		})
+	}
+
+	return reports
+}
+
+func stopTimer(t *time.Timer) {
+	if t == nil {
+		return
+	}
+	if !t.Stop() {
+		select {
+		case <-t.C:
+		default:
+		}
+	}
 }

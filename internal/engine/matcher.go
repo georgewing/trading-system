@@ -138,13 +138,22 @@ func sumExecutedQty(trades []Trade) int64 {
 
 // SubmitOrder 提交订单并执行撮合（生产主入口）
 func (m *Matcher) SubmitOrder(ctx context.Context, order Order) ([]Trade, error) {
-	trades, remainingQty, err := m.Match(ctx, order)
+	result, err := m.SubmitOrderDetailed(ctx, order)
 	if err != nil {
 		return nil, err
 	}
+	return result.Trades, nil
+}
+
+// SubmitOrderDetailed 返回生产执行回报所需的完整语义。
+func (m *Matcher) SubmitOrderDetailed(ctx context.Context, order Order) (SubmitResult, error) {
+	trades, remainingQty, err := m.Match(ctx, order)
+	if err != nil {
+		return SubmitResult{}, err
+	}
 
 	executed := sumExecutedQty(trades)
-	result := &SubmitResult{
+	result := SubmitResult{
 		Trades:      trades,
 		ExecutedQty: executed,
 	}
@@ -161,7 +170,7 @@ func (m *Matcher) SubmitOrder(ctx context.Context, order Order) ([]Trade, error)
 			} else {
 				result.FinalStatus = OrderStatusCanceled
 			}
-			return result.Trades, nil
+			return result, nil
 		case order.TIF == TimeInForceFOK:
 			// FOK: 必须全部成交，否则整单拒绝并回滚已扣减的对侧订单簿
 			for _, t := range trades {
@@ -172,7 +181,7 @@ func (m *Matcher) SubmitOrder(ctx context.Context, order Order) ([]Trade, error)
 					m.ob.bids.Add(t.Price, t.Quantity)
 				}
 			}
-			return SubmitResult{}.Trades, errors.New("FOK: cannot fully fill")
+			return SubmitResult{}, errors.New("FOK: cannot fully fill")
 		default: // LIMIT + GTC → 剩余挂单
 			priceInt := order.Price
 			qtyInt := remainingQty
@@ -191,7 +200,7 @@ func (m *Matcher) SubmitOrder(ctx context.Context, order Order) ([]Trade, error)
 				result.FinalStatus = OrderStatusNew
 			}
 
-			return result.Trades, nil
+			return result, nil
 		}
 	}
 
@@ -201,7 +210,7 @@ func (m *Matcher) SubmitOrder(ctx context.Context, order Order) ([]Trade, error)
 		result.FinalStatus = OrderStatusNew
 	}
 
-	return result.Trades, nil
+	return result, nil
 }
 
 // isCrossing 判断是否价格交叉
