@@ -7,7 +7,7 @@ import (
 var node *snowflake.Node
 
 // Init
-func init(workerID int64) error {
+func Init(workerID int64) error {
 	var err error
 	node, err = snowflake.NewNode(workerID)
 	return err

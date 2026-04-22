@@ -7,6 +7,7 @@ import (
 	"sync/atomic"
 	"time"
 	"trading-system/internal/engine"
+	"trading-system/internal/observability"
 	"trading-system/pkg/ringbuffer"
 )
 
@@ -55,6 +56,7 @@ type OutboundWorker struct {
 	queue *ringbuffer.RingBuffer[engine.ExecReport]
 	cfg   OutboundWorkerConfig
 	dlq   DeadLetterHandler
+	met   observability.Recorder
 
 	sinks []sinkRuntime
 	wg    sync.WaitGroup
@@ -106,8 +108,18 @@ func NewOutboundWorker(
 		queue: queue,
 		cfg:   cfg,
 		dlq:   dlq,
+		met:   observability.NoopRecorder(),
 		sinks: rt,
 	}
+}
+
+// SetMetrics 注入指标采集器，nil 会回退为 noop。
+func (w *OutboundWorker) SetMetrics(recorder observability.Recorder) {
+	if recorder == nil {
+		w.met = observability.NoopRecorder()
+		return
+	}
+	w.met = recorder
 }
 
 func (w *OutboundWorker) Start(ctx context.Context) {
@@ -166,6 +178,7 @@ func (w *OutboundWorker) runDispatcher(ctx context.Context) {
 				time.Sleep(w.cfg.DispatchIdleSleep)
 				continue
 			}
+			w.met.SetQueueBacklog("outbound", float64(w.queue.Len()))
 
 			for _, sr := range w.sinks {
 				timer := time.NewTimer(w.cfg.DispatchTimeout)

@@ -8,6 +8,7 @@ import (
 	"sync/atomic"
 	"time"
 	"trading-system/internal/engine"
+	"trading-system/internal/observability"
 	"trading-system/pkg/ringbuffer"
 )
 
@@ -52,6 +53,7 @@ type EventBus struct {
 	queue    *ringbuffer.RingBuffer[OrderCommand]
 	matcher  *engine.Matcher
 	outbound *ringbuffer.RingBuffer[engine.ExecReport]
+	metrics  observability.Recorder
 
 	cfg      EventBusConfig
 	submitMu sync.Mutex // ringbuffer 是 SPSC；多 producer 时必须保护 enqueue
@@ -96,8 +98,18 @@ func NewEventBusWithConfig(matcher *engine.Matcher, cfg EventBusConfig) *EventBu
 		queue:    ringbuffer.New[OrderCommand](cfg.InboundCapacity),
 		matcher:  matcher,
 		outbound: ringbuffer.New[engine.ExecReport](cfg.OutboundCapacity),
+		metrics:  observability.NoopRecorder(),
 		cfg:      cfg,
 	}
+}
+
+// SetMetrics 注入指标采集器，nil 会回退为 noop。
+func (b *EventBus) SetMetrics(recorder observability.Recorder) {
+	if recorder == nil {
+		b.metrics = observability.NoopRecorder()
+		return
+	}
+	b.metrics = recorder
 }
 
 // 兼容旧接口
@@ -118,14 +130,19 @@ func (b *EventBus) SubmitWithContext(ctx context.Context, cmd OrderCommand) erro
 		ok := b.queue.Enqueue(cmd)
 		b.submitMu.Unlock()
 		if ok {
+			b.metrics.IncOrderArrival("accepted")
+			b.metrics.SetQueueBacklog("inbound", float64(b.queue.Len()))
 			return nil
 		}
 
 		select {
 		case <-ctx.Done():
+			b.metrics.IncOrderArrival("canceled")
 			return ctx.Err()
 		case <-timer.C:
 			b.droppedInbound.Add(1)
+			b.metrics.IncOrderArrival("rejected")
+			b.metrics.SetQueueBacklog("inbound", float64(b.queue.Len()))
 			return ErrInboundQueueFull
 		default:
 			time.Sleep(b.cfg.RetrySleep)
@@ -157,8 +174,15 @@ func (b *EventBus) Start(ctx context.Context) {
 					time.Sleep(b.cfg.IdleSleep)
 					continue
 				}
+				b.metrics.SetQueueBacklog("inbound", float64(b.queue.Len()))
 
+				matchStart := time.Now()
 				result, matchErr := b.matcher.SubmitOrderDetailed(ctx, cmd.Order)
+				if matchErr != nil {
+					b.metrics.ObserveMatchLatency("error", time.Since(matchStart))
+				} else {
+					b.metrics.ObserveMatchLatency("ok", time.Since(matchStart))
+				}
 
 				b.sendResult(ctx, cmd.ResultCh, MatchResult{
 					Trades: result.Trades,
@@ -201,6 +225,7 @@ func (b *EventBus) enqueueReport(ctx context.Context, report engine.ExecReport) 
 
 	for {
 		if b.outbound.Enqueue(report) {
+			b.metrics.SetQueueBacklog("outbound", float64(b.outbound.Len()))
 			return nil
 		}
 

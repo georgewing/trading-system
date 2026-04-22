@@ -4,9 +4,12 @@ package http
 
 import (
 	"encoding/json"
+	"math"
 	"net/http"
 	"strconv"
 	"time"
+	"trading-system/internal/pipeline"
+	"trading-system/pkg/idgen"
 
 	"trading-system/internal/engine"
 )
@@ -38,7 +41,13 @@ type ErrorResponse struct {
 
 // MakeMatchEndpoint 创建撮合端点 Handler
 // metrics 参数预留（未来注入 Prometheus / observability.Metrics）
-func MakeMatchEndpoint(matcher *engine.Matcher) http.Handler {
+func MakeMatchEndpoint(bus *pipeline.EventBus) http.Handler {
+	if bus == nil {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			writeError(w, http.StatusInternalServerError, "matching bus unavailable")
+		})
+	}
+
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
 		_ = start // TODO: metrics.ObserveMatchLatency("http.match", time.Since(start))
@@ -51,22 +60,43 @@ func MakeMatchEndpoint(matcher *engine.Matcher) http.Handler {
 		}
 
 		// 校验
-		if req.OrderID == "" || (req.Side != "BUY" && req.Side != "SELL") {
-			writeError(w, http.StatusBadRequest, "invalid side or order_id")
+		if req.Side != "BUY" && req.Side != "SELL" {
+			writeError(w, http.StatusBadRequest, "invalid side")
 			return
 		}
 
-		// 将 string OrderID 转换为 uint64
-		orderID, err := strconv.ParseUint(req.OrderID, 10, 64)
-		if err != nil {
-			writeError(w, http.StatusBadRequest, "order_id must be a numeric string")
+		if req.Type != "LIMIT" && req.Type != "MARKET" {
+			writeError(w, http.StatusBadRequest, "invalid type")
+			return
+		}
+
+		if req.TimeInForce != "GTC" && req.TimeInForce != "IOC" && req.TimeInForce != "FOK" {
+			writeError(w, http.StatusBadRequest, "invalid time_in_force")
+			return
+		}
+
+		if req.Price <= 0 {
+			writeError(w, http.StatusBadRequest, "invalid price")
+			return
+		}
+
+		if req.Quantity == "" {
+			writeError(w, http.StatusBadRequest, "invalid quantity")
 			return
 		}
 
 		// 将 float64 Price 转换为 int64（调用方应传入已乘以精度的整数值，
 		// 或在此处乘以精度——取决于 API 契约，当前简化取整）
+		// 当前引擎 pricePrecision=1，先禁止小数，避免 silent truncation
+		if req.Price != math.Trunc(req.Price) {
+			writeError(w, http.StatusBadRequest, "price must be integer ticks")
+			return
+		}
 		priceInt := int64(req.Price)
-
+		if priceInt <= 0 {
+			writeError(w, http.StatusBadRequest, "invalid price")
+			return
+		}
 		// 映射 Side
 		var side engine.Side
 		if req.Side == "BUY" {
@@ -75,46 +105,38 @@ func MakeMatchEndpoint(matcher *engine.Matcher) http.Handler {
 			side = engine.SideSell
 		}
 
+		orderID := idgen.NextID()
+
 		// 构造领域 Order
 		order := engine.Order{
-			ID:       orderID,
-			Side:     side,
-			Price:    priceInt,
-			Quantity: req.Quantity,
-			Type:     engine.OrderType(req.Type),
-			TIF:      engine.TimeInForce(req.TimeInForce),
+			ID:            orderID,
+			Side:          side,
+			Price:         priceInt,
+			Quantity:      req.Quantity,
+			Type:          engine.OrderType(req.Type),
+			TIF:           engine.TimeInForce(req.TimeInForce),
+			ClientOrderID: req.OrderID,
 		}
 
-		// 执行撮合
-		trades, err := matcher.SubmitOrder(r.Context(), order)
-		if err != nil {
-			// 生产中可根据错误类型映射不同 HTTP 码
-			code := http.StatusInternalServerError
-			if err.Error() == "FOK: cannot fully fill" {
-				code = http.StatusUnprocessableEntity
-			}
-			writeError(w, code, err.Error())
+		cmd := pipeline.OrderCommand{
+			Order:    order,
+			ResultCh: nil,
+		}
+
+		if err := bus.SubmitWithContext(r.Context(), cmd); err != nil {
+			writeError(w, http.StatusServiceUnavailable, "exchange overload")
 			return
 		}
 
-		// 计算已成交数量
-		var executed int64
-		for _, t := range trades {
-			executed += t.Quantity
-		}
-
-		// 返回响应
-		resp := MatchResponse{
-			Trades:     trades,
-			Remaining:  0, // SubmitOrder 内部已处理挂单，剩余 qty 不在这里返回（可扩展）
-			OrderID:    req.OrderID,
-			ExecuteQty: executed,
-			Timestamp:  time.Now().UnixNano(),
-		}
-
 		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
-		json.NewEncoder(w).Encode(resp)
+		w.WriteHeader(http.StatusAccepted) // 使用 202 Accepted 表示已接收请求但尚未处理完成
+
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"status":     "accepted",
+			"order_id":   strconv.FormatUint(orderID, 10),
+			"client_oid": req.OrderID,
+			"msg":        "Order received, awaiting execution",
+		})
 
 		// TODO: 生产中在这里异步推送 WS / ClickHouse
 	})
