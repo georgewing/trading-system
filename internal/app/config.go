@@ -1,7 +1,7 @@
 package app
 
 import (
-	"encoding/json"
+	"go.yaml.in/yaml/v2"
 	"os"
 )
 
@@ -14,8 +14,8 @@ type Config struct {
 }
 
 type ServerConfig struct {
-	APIAddr     string
-	MetricsAddr string
+	APIAddr     string `yaml:"api_addr"`
+	MetricsAddr string `yaml:"metrics_addr"`
 }
 
 type MatcherConfig struct {
@@ -41,7 +41,7 @@ func Load(path string) (*Config, error) {
 		return nil, err
 	}
 	var cfg Config
-	if err := json.Unmarshal(data, &cfg); err != nil {
+	if err := yaml.UnmarshalStrict(data, &cfg); err != nil {
 		return nil, err
 	}
 	return &cfg, nil

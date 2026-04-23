@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"flag"
 	"log"
 	"os"
 	"os/signal"
@@ -10,6 +11,21 @@ import (
 )
 
 func main() {
+	configPath := flag.String("config", "", "path to yaml config")
+	flag.Parse()
+
+	if *configPath == "" {
+		*configPath = os.Getenv("APP_CONFIG")
+	}
+	if *configPath == "" {
+		log.Fatal("config path is required: use -config or APP_CONFIG")
+	}
+
+	cfg, err := app.Load(*configPath)
+	if err != nil {
+		log.Fatalf("load config failed (%s): %v", *configPath, err)
+	}
+
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -24,7 +40,7 @@ func main() {
 	}()
 
 	// 启动应用
-	if err := app.Run(ctx); err != nil {
+	if err := app.Run(ctx, cfg); err != nil {
 		log.Fatalf("app run error: %v", err)
 	}
 	log.Println("app started")

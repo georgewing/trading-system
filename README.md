@@ -17,7 +17,7 @@ trading-system/
 │   │   ├── market-service/
 │   │   ├── risk-service/
 │   │   └── helm/               # Helm chart
-│   └── .docker-compose.yaml      # 可选：postgres+timescale、clickhouse、redis
+│   └── docker-compose.yml      # 可选：postgres+timescale、clickhouse、redis
 ├── internal/
 │   ├── app/                     # 组装：依赖注入、生命周期、配置加载
 │   │   ├── app.go
