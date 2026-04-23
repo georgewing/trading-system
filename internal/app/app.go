@@ -36,7 +36,7 @@ func (r *inMemoryExecReportRepo) Count() int {
 	return len(r.reports)
 }
 
-func Run(ctx context.Context) error {
+func Run(ctx context.Context, cfg *Config) error {
 	v := os.Getenv("SNOWFLAKE_WORKER_ID")
 	if v == "" {
 		return errors.New("SNOWFLAKE_WORKER_ID is required")
@@ -57,13 +57,16 @@ func Run(ctx context.Context) error {
 	ob := engine.NewOrderBook("BTCUSDT", 1, 1)
 	matcher := engine.NewMatcher(ob)
 
-	busCfg := pipeline.DefaultEventBusConfig()
+	busCfg := pipeline.EventBusConfig{
+		InboundCapacity:  cfg.Pipeline.InboundCapacity,
+		OutboundCapacity: cfg.Pipeline.OutboundCapacity,
+	}
 	bus := pipeline.NewEventBusWithConfig(matcher, busCfg)
 	bus.SetMetrics(metrics)
 	pipelineCtx, pipelineCancel := context.WithCancel(context.Background())
 	bus.Start(pipelineCtx)
 
-	wsHub := ws.NewHub(1024)
+	wsHub := ws.NewHub(cfg.WebSocket.BufferSize)
 	repo := &inMemoryExecReportRepo{}
 
 	workerCfg := pipeline.DefaultOutboundWorkerConfig()
@@ -80,7 +83,7 @@ func Run(ctx context.Context) error {
 	metricsMux := http.NewServeMux()
 	metricsMux.Handle("/metrics", metrics.Handler())
 	metricsSrv := &http.Server{
-		Addr:              ":9090",
+		Addr:              cfg.Server.MetricsAddr,
 		Handler:           metricsMux,
 		ReadHeaderTimeout: 3 * time.Second,
 	}
@@ -89,7 +92,7 @@ func Run(ctx context.Context) error {
 	apiMux.Handle("/api/v1/order", tradinghttp.MakeMatchEndpoint(bus))
 
 	apiSrv := &http.Server{
-		Addr:              ":8080",
+		Addr:              cfg.Server.APIAddr,
 		Handler:           apiMux,
 		ReadHeaderTimeout: 3 * time.Second,
 	}

@@ -1,0 +1,18 @@
+server:
+  api_addr: ":8090"
+  metrics_addr: ":9090"
+
+matcher:
+  symbol: "BTCUSDT"
+  price_precision: 8
+  quantity_precision: 8
+
+pipeline:
+  inbound_capacity: 1048576
+  outbound_capacity: 1048576
+
+storage:
+  postgres_dsn: "postgres://user:pass@localhost:5432/trading?sslmode=disable"
+
+websocket:
+  buffer_size: 1024
