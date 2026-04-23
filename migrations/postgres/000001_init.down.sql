@@ -1,0 +1,7 @@
+BEGIN;
+
+DROP TABLE IF EXISTS execution_reports;
+DROP TABLE IF EXISTS trades;
+DROP TABLE IF EXISTS orders;
+
+COMMIT;
