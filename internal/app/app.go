@@ -15,12 +15,15 @@ import (
 	"trading-system/pkg/idgen"
 
 	"trading-system/internal/engine"
-	"trading-system/internal/gateway/binance"
-	"trading-system/internal/market"
+	"trading-system/internal/execution"
+	"trading-system/internal/hft/domain"
+	"trading-system/internal/hft/infra/binance"
+	"trading-system/internal/hft/infra/memstore"
 	"trading-system/internal/observability"
 	"trading-system/internal/orders"
 	"trading-system/internal/pipeline"
 	"trading-system/internal/risk"
+	"trading-system/internal/routing"
 	tradinghttp "trading-system/internal/transport/http"
 	"trading-system/internal/transport/ws"
 )
@@ -60,7 +63,7 @@ func Run(ctx context.Context, cfg *Config) error {
 		return err
 	}
 
-	marketStore, marketClient, err := newMarketFeed(cfg, metrics)
+	plane, err := newMarketPlane(cfg, priceScale, quantityScale)
 	if err != nil {
 		_ = apiLn.Close()
 		_ = metricsLn.Close()
@@ -70,35 +73,124 @@ func Run(ctx context.Context, cfg *Config) error {
 	ob := engine.NewOrderBook(cfg.Matcher.Symbol, priceScale, quantityScale)
 	matcher := engine.NewMatcher(ob)
 
+	paper := execution.NewPaperVenue("paper", matcher)
+	defaultVenue := cfg.Routing.DefaultVenue
+	if defaultVenue == "" {
+		defaultVenue = "paper"
+	}
+	router, err := routing.NewRouter(defaultVenue, map[string]execution.Venue{"paper": paper}, cfg.Routing.SymbolVenues)
+	if err != nil {
+		_ = apiLn.Close()
+		_ = metricsLn.Close()
+		return err
+	}
+
 	busCfg := pipeline.EventBusConfig{
 		InboundCapacity:  cfg.Pipeline.InboundCapacity,
 		OutboundCapacity: cfg.Pipeline.OutboundCapacity,
 	}
 	bus := pipeline.NewEventBusWithConfig(matcher, busCfg)
 	bus.SetMetrics(metrics)
+	bus.SetVenueResolver(router)
+
+	var riskHub *ws.RiskHub
+	var riskSink *risk.AsyncSink
 	if cfg.Risk.Enabled {
-		bus.SetRiskGuard(risk.NewGuard(risk.Config{
-			SymbolWhitelist:    cfg.Risk.SymbolWhitelist,
-			MaxOrderQty:        cfg.Risk.MaxOrderQty,
-			MaxNotional:        cfg.Risk.MaxNotional,
-			PriceBandBps:       cfg.Risk.PriceBandBps,
-			MaxOrdersPerWindow: cfg.Risk.MaxOrdersPerWindow,
-			Window:             time.Duration(cfg.Risk.WindowSeconds) * time.Second,
-			MaxPosition:        cfg.Risk.MaxPosition,
-		}), quantityScale)
-		log.Printf("pre-trade risk enabled: whitelist=%d max_order_qty=%d max_notional=%d price_band_bps=%d max_orders_per_window=%d window=%ds max_position=%d",
-			len(cfg.Risk.SymbolWhitelist), cfg.Risk.MaxOrderQty, cfg.Risk.MaxNotional, cfg.Risk.PriceBandBps,
-			cfg.Risk.MaxOrdersPerWindow, cfg.Risk.WindowSeconds, cfg.Risk.MaxPosition)
+		maxOrderQty, err := scaleBy(cfg.Risk.MaxOrderQty, quantityScale)
+		if err != nil {
+			_ = apiLn.Close()
+			_ = metricsLn.Close()
+			return fmt.Errorf("risk.max_order_qty: %w", err)
+		}
+		maxPosition, err := scaleBy(cfg.Risk.MaxPosition, quantityScale)
+		if err != nil {
+			_ = apiLn.Close()
+			_ = metricsLn.Close()
+			return fmt.Errorf("risk.max_position: %w", err)
+		}
+		maxDailyLoss, err := scaleNotional(cfg.Risk.Intraday.MaxDailyLoss, priceScale, quantityScale)
+		if err != nil {
+			_ = apiLn.Close()
+			_ = metricsLn.Close()
+			return fmt.Errorf("risk.intraday.max_daily_loss: %w", err)
+		}
+
+		positions := risk.NewPositions()
+		riskHub = ws.NewRiskHub(cfg.WebSocket.BufferSize, 100)
+		riskSink = risk.NewAsyncSink(risk.MultiSink{risk.NewLogSink(), riskHub}, 1024, metrics)
+
+		intraday := cfg.Risk.Intraday
+		riskEngine := risk.NewEngine(risk.EngineConfig{
+			PreTrade: risk.Config{
+				SymbolWhitelist:    cfg.Risk.SymbolWhitelist,
+				MaxOrderQty:        maxOrderQty,
+				MaxNotional:        cfg.Risk.MaxNotional,
+				PriceBandBps:       cfg.Risk.PriceBandBps,
+				MaxOrdersPerWindow: cfg.Risk.MaxOrdersPerWindow,
+				Window:             time.Duration(cfg.Risk.WindowSeconds) * time.Second,
+				MaxPosition:        maxPosition,
+			},
+			Intraday: risk.IntradayConfig{
+				MaxCancelRatioBps: intraday.MaxCancelRatioBps,
+				CancelWindow:      time.Duration(intraday.CancelWindowSeconds) * time.Second,
+				MinCancelSamples:  intraday.MinCancelSamples,
+				MaxOpenOrders:     intraday.MaxOpenOrders,
+				MaxDailyLoss:      maxDailyLoss,
+				MaxDrawdownBps:    intraday.MaxDrawdownBps,
+				Cooldown:          time.Duration(intraday.CooldownSeconds) * time.Second,
+				ResumeAuto:        intraday.ResumeAuto,
+			},
+		}, positions,
+			risk.WithReferencePrice(referencePrice(plane.snapshotter())),
+			risk.WithEvents(riskSink),
+			risk.WithMetrics(metrics),
+		)
+		bus.SetRiskGuard(riskEngine, quantityScale)
+		bus.SetRiskPriceScale(priceScale)
+		bus.SetRiskObserver(riskEngine)
+		log.Printf("risk enabled: whitelist=%d max_order_qty_lots=%d max_notional_quote=%d price_band_bps=%d max_orders_per_window=%d window=%ds max_position_lots=%d",
+			len(cfg.Risk.SymbolWhitelist), maxOrderQty, cfg.Risk.MaxNotional, cfg.Risk.PriceBandBps,
+			cfg.Risk.MaxOrdersPerWindow, cfg.Risk.WindowSeconds, maxPosition)
+		log.Printf("intraday risk: cancel_ratio_bps=%d cancel_window=%ds min_samples=%d max_open_orders=%d max_daily_loss=%d max_drawdown_bps=%d cooldown=%ds resume_auto=%v",
+			intraday.MaxCancelRatioBps, intraday.CancelWindowSeconds, intraday.MinCancelSamples,
+			intraday.MaxOpenOrders, intraday.MaxDailyLoss, intraday.MaxDrawdownBps,
+			intraday.CooldownSeconds, intraday.ResumeAuto)
 	}
+
+	extraSinks, pgWriter, err := newPersistenceSinks(ctx, cfg)
+	if err != nil {
+		_ = apiLn.Close()
+		_ = metricsLn.Close()
+		return err
+	}
+
 	pipelineCtx, pipelineCancel := context.WithCancel(context.Background())
 
-	if marketClient != nil {
+	if plane.source != nil {
+		emit := func(ev domain.Event) {
+			plane.cache.Apply(ev)
+			plane.fanout.Publish(ev)
+
+			stream := ev.Kind.String()
+			metrics.IncFeedMessage(stream)
+			if ev.TS > 0 {
+				lag := time.Since(time.UnixMilli(ev.TS))
+				if lag < 0 {
+					lag = 0
+				}
+				metrics.SetFeedLag(stream, lag)
+			}
+		}
+
 		go func() {
-			if err := marketClient.Run(pipelineCtx); err != nil && pipelineCtx.Err() == nil {
+			if err := plane.source.Run(pipelineCtx, plane.symbols, emit); err != nil && pipelineCtx.Err() == nil {
 				log.Printf("market feed stopped: %v", err)
 			}
 		}()
-		log.Printf("market feed started: provider=%s stream=%s", cfg.Market.Provider, marketClient.URL())
+		go reportFeedCounters(pipelineCtx, plane, metrics)
+
+		log.Printf("market feed started: provider=%s symbols=%v depth=%d@%s kline=%q",
+			cfg.Market.Provider, plane.symbols, cfg.Market.DepthLevels, cfg.Market.DepthSpeed, cfg.Market.KlineInterval)
 	}
 
 	bus.Start(pipelineCtx)
@@ -108,12 +200,16 @@ func Run(ctx context.Context, cfg *Config) error {
 	book := orders.NewBook(10000)
 
 	workerCfg := pipeline.DefaultOutboundWorkerConfig()
+	sinks := []pipeline.ExecReportSink{
+		pipeline.NewWSSink(wsHub),
+		pipeline.NewStorageSink(book),
+	}
+	sinks = append(sinks, extraSinks...)
 	worker := pipeline.NewOutboundWorker(
 		bus.Outbound(),
 		workerCfg,
 		&pipeline.LogDeadLetter{},
-		pipeline.NewWSSink(wsHub),
-		pipeline.NewStorageSink(book),
+		sinks...,
 	)
 	worker.SetMetrics(metrics)
 	worker.Start(pipelineCtx)
@@ -138,20 +234,26 @@ func Run(ctx context.Context, cfg *Config) error {
 		cfg.Matcher.Symbol, cfg.Matcher.PricePrecision, cfg.Matcher.QuantityPrecision,
 	))
 
-	var marketFeed ws.MarketFeed
-	if marketStore != nil {
-		marketFeed = marketStore
-		apiMux.Handle("/api/v1/market/depth", tradinghttp.MakeDepthEndpoint(marketStore, cfg.Matcher.Symbol))
-		apiMux.Handle("/api/v1/market/trades", tradinghttp.MakeTradesEndpoint(marketStore, cfg.Matcher.Symbol))
-		apiMux.Handle("/api/v1/market/kline", tradinghttp.MakeKlineEndpoint(marketStore, cfg.Matcher.Symbol))
-	}
+	snapshotter := plane.snapshotter()
+	apiMux.Handle("/api/v1/market/depth", tradinghttp.MakeDepthEndpoint(
+		snapshotter, cfg.Matcher.Symbol, cfg.Matcher.PricePrecision, cfg.Matcher.QuantityPrecision,
+	))
+	apiMux.Handle("/api/v1/market/trades", tradinghttp.MakeTradesEndpoint(
+		snapshotter, cfg.Matcher.Symbol, cfg.Matcher.PricePrecision, cfg.Matcher.QuantityPrecision,
+	))
+	apiMux.Handle("/api/v1/market/kline", tradinghttp.MakeKlineEndpoint(
+		snapshotter, cfg.Matcher.Symbol, cfg.Matcher.PricePrecision, cfg.Matcher.QuantityPrecision,
+	))
 
-	wsServer := ws.NewServer(marketFeed, wsHub, ws.ServerConfig{
+	wsServer := ws.NewServer(plane.stream(), snapshotter, wsHub, ws.ServerConfig{
 		Symbol:            cfg.Matcher.Symbol,
 		PricePrecision:    cfg.Matcher.PricePrecision,
 		QuantityPrecision: cfg.Matcher.QuantityPrecision,
 	})
 	wsServer.SetMetrics(metrics)
+	if riskHub != nil {
+		wsServer.SetRiskFeed(riskHub)
+	}
 	apiMux.Handle("/ws", wsServer)
 
 	apiSrv := &http.Server{
@@ -183,16 +285,54 @@ func Run(ctx context.Context, cfg *Config) error {
 	}
 	waitCancel()
 
+	if pgWriter != nil {
+		if err := pgWriter.Close(); err != nil {
+			log.Printf("postgres writer close failed: %v", err)
+		}
+	}
+
+	log.Printf("pipeline stopped: tracked orders=%d", book.Len())
+	if riskSink != nil {
+		closeCtx, closeCancel := context.WithTimeout(context.Background(), 2*time.Second)
+		if err := riskSink.Close(closeCtx); err != nil {
+			log.Printf("risk sink close failed: %v", err)
+		}
+		closeCancel()
+	}
+
 	log.Printf("pipeline stopped: tracked orders=%d", book.Len())
 	return runErr
 }
 
-// newMarketFeed builds the optional external market-data feed. It returns nils
-// when the feed is disabled, so callers can treat a nil store as "market data
-// unavailable" without branching on config.
-func newMarketFeed(cfg *Config, met *observability.PrometheusMetrics) (*market.Store, *binance.Client, error) {
+// marketPlane groups the market-data adapters. A zero-value plane (market
+// disabled) is valid: both accessors return nil and the transports degrade to
+// "market data unavailable" instead of failing startup.
+type marketPlane struct {
+	fanout  *domain.MemFanout
+	cache   *memstore.Market
+	symbols []string
+	source  *binance.Source
+}
+
+func (p *marketPlane) stream() domain.Fanout {
+	if p == nil || p.fanout == nil {
+		return nil
+	}
+	return p.fanout
+}
+
+func (p *marketPlane) snapshotter() domain.Snapshotter {
+	if p == nil || p.cache == nil {
+		return nil
+	}
+	return p.cache
+}
+
+// newMarketPlane wires the market-data ports: a Binance source feeding both the
+// snapshot cache and the fan-out.
+func newMarketPlane(cfg *Config, priceScale, qtyScale int64) (*marketPlane, error) {
 	if !cfg.Market.Enabled {
-		return nil, nil, nil
+		return &marketPlane{}, nil
 	}
 
 	provider := cfg.Market.Provider
@@ -200,49 +340,101 @@ func newMarketFeed(cfg *Config, met *observability.PrometheusMetrics) (*market.S
 		provider = "binance"
 	}
 	if provider != "binance" {
-		return nil, nil, fmt.Errorf("unsupported market provider %q", provider)
+		return nil, fmt.Errorf("unsupported market provider %q", provider)
 	}
 
-	storeCfg := market.DefaultStoreConfig()
-	if cfg.Market.StoreTradeCap > 0 {
-		storeCfg.TradeCap = cfg.Market.StoreTradeCap
-	}
-	if cfg.Market.StoreKlineCap > 0 {
-		storeCfg.KlineCap = cfg.Market.StoreKlineCap
+	symbol := cfg.Market.Symbol
+	if symbol == "" {
+		symbol = cfg.Matcher.Symbol
 	}
 
-	store := market.NewStore(storeCfg)
-	store.SetMetrics(met)
+	dialer, err := binance.NewWebsocketDialer(binance.StreamConfig{
+		BaseURL:       cfg.Market.WSURL,
+		DepthLevels:   cfg.Market.DepthLevels,
+		DepthSpeed:    cfg.Market.DepthSpeed,
+		KlineInterval: cfg.Market.KlineInterval,
+	})
+	if err != nil {
+		return nil, err
+	}
 
-	feedCfg := binance.DefaultConfig()
-	if cfg.Market.WSURL != "" {
-		feedCfg.WSURL = cfg.Market.WSURL
-	}
-	feedCfg.Symbol = cfg.Market.Symbol
-	if feedCfg.Symbol == "" {
-		feedCfg.Symbol = cfg.Matcher.Symbol
-	}
-	if cfg.Market.DepthLevels > 0 {
-		feedCfg.DepthLevels = cfg.Market.DepthLevels
-	}
-	if cfg.Market.DepthSpeed != "" {
-		feedCfg.DepthSpeed = cfg.Market.DepthSpeed
-	}
-	if cfg.Market.KlineInterval != "" {
-		feedCfg.KlineInterval = cfg.Market.KlineInterval
-	}
+	backoff := binance.Backoff{Base: time.Second, Max: 30 * time.Second}
 	if cfg.Market.ReconnectMinSeconds > 0 {
-		feedCfg.ReconnectMin = time.Duration(cfg.Market.ReconnectMinSeconds) * time.Second
+		backoff.Base = time.Duration(cfg.Market.ReconnectMinSeconds) * time.Second
 	}
 	if cfg.Market.ReconnectMaxSeconds > 0 {
-		feedCfg.ReconnectMax = time.Duration(cfg.Market.ReconnectMaxSeconds) * time.Second
+		backoff.Max = time.Duration(cfg.Market.ReconnectMaxSeconds) * time.Second
 	}
 
-	client, err := binance.NewClient(feedCfg, store, met)
+	source, err := binance.NewSource(binance.SourceConfig{
+		Decoder: binance.Decoder{
+			PriceScale: priceScale,
+			QtyScale:   qtyScale,
+			Symbol:     symbol,
+		},
+		Dial:    dialer,
+		Backoff: backoff,
+	})
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
-	return store, client, nil
+
+	return &marketPlane{
+		fanout: domain.NewMemFanout(cfg.WebSocket.BufferSize),
+		cache: memstore.New(memstore.Config{
+			TradeCap: cfg.Market.StoreTradeCap,
+			KlineCap: cfg.Market.StoreKlineCap,
+		}),
+		symbols: []string{symbol},
+		source:  source,
+	}, nil
+}
+
+// reportFeedCounters mirrors the source's internal counters into Prometheus.
+// The counters are cumulative, so only the delta since the last tick is added.
+func reportFeedCounters(ctx context.Context, plane *marketPlane, met *observability.PrometheusMetrics) {
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+
+	var reconnects, drops uint64
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if n := plane.source.Reconnects(); n > reconnects {
+				met.AddFeedReconnect("binance", n-reconnects)
+				reconnects = n
+			}
+			if n := plane.fanout.Dropped(); n > drops {
+				met.AddFeedDrop("fanout", n-drops)
+				drops = n
+			}
+		}
+	}
+}
+
+// referencePrice builds the mid-price provider used by the price-band check. It
+// prefers the live market book and falls back to "no reference" (0) when data
+// is unavailable, which disables the check instead of rejecting every order.
+// Depth levels are already integers in the instrument's minimal unit, so no
+// string parsing or float conversion is involved.
+func referencePrice(snap domain.Snapshotter) func(string) int64 {
+	if snap == nil {
+		return nil
+	}
+	return func(symbol string) int64 {
+		depth, ok := snap.Depth(symbol)
+		if !ok || len(depth.Bids) == 0 || len(depth.Asks) == 0 {
+			return 0
+		}
+		bid := depth.Bids[0].Price
+		ask := depth.Asks[0].Price
+		if bid <= 0 || ask <= 0 || ask < bid {
+			return 0
+		}
+		return bid + (ask-bid)/2
+	}
 }
 
 func pow10(exp int) (int64, error) {
@@ -257,6 +449,38 @@ func pow10(exp int) (int64, error) {
 		v *= 10
 	}
 	return v, nil
+}
+
+// scaleBy converts a human-readable limit into engine integer units. A zero or
+// negative limit is passed through so the risk config stays disabled.
+func scaleBy(v, scale int64) (int64, error) {
+	if v <= 0 {
+		return v, nil
+	}
+	if scale <= 0 {
+		return 0, fmt.Errorf("scale must be positive")
+	}
+	if v > math.MaxInt64/scale {
+		return 0, fmt.Errorf("value %d overflows with scale %d", v, scale)
+	}
+	return v * scale, nil
+}
+
+func scaleNotional(v, priceScale, quantityScale int64) (int64, error) {
+	if v <= 0 {
+		return v, nil
+	}
+	if priceScale <= 0 || quantityScale <= 0 {
+		return 0, fmt.Errorf("scales must be positive")
+	}
+	if v > math.MaxInt64/priceScale {
+		return 0, fmt.Errorf("value %d overflows with price scale %d", v, priceScale)
+	}
+	v *= priceScale
+	if v > math.MaxInt64/quantityScale {
+		return 0, fmt.Errorf("value %d overflows with quantity scale %d", v, quantityScale)
+	}
+	return v * quantityScale, nil
 }
 
 // listenServers binds both HTTP listeners before any serving starts. This makes

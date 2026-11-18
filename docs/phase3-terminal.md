@@ -6,10 +6,12 @@ Status: vertical slice running end-to-end with real Binance market data.
 
 | Layer | Package | Notes |
 |---|---|---|
-| Market feed | `internal/gateway/binance` | public combined stream, reconnecting |
-| Market state | `internal/market` | depth / trades / klines, in-memory, fan-out |
+| Domain contract | `internal/hft/domain` | Event/Kind, Source/Sink/Fanout/Snapshotter ports, MemFanout |
+| Binance adapter | `internal/hft/infra/binance` | pure decoder + injectable `Dialer` (coder/websocket) |
+| Snapshot adapter | `internal/hft/infra/memstore` | bounded depth/trades/klines read model |
 | Order read model | `internal/orders` | submission + latest execution state |
 | WS transport | `internal/transport/ws` | `/ws`, topics, seq, snapshots |
+| Wire formatting | `internal/transport/wire` | int64 minimal units -> decimal strings |
 | REST | `internal/transport/http` | depth, klines, trades, orders, meta |
 | Terminal | `frontend/` | React + TS + lightweight-charts |
 
@@ -118,17 +120,28 @@ Types: `system.hello`, `system.pong`, `system.error`, `market.depth`,
    top-20 snapshots, so no delta reconstruction is needed. A true incremental
    feed would need sequence-based book maintenance.
 
-## Duplicate work in this tree
+## Architecture: ports and adapters
 
-`internal/hft/{domain,infra/binance}` contains a second, parallel market-data
-design (integer minimal units, trade + BBO only, injectable `Dialer`). It has no
-network transport, no WS/HTTP surface and no wiring, so it does not run today.
+Market data follows a ports/adapters split, so the ingest path can change venue
+or storage without touching the transports:
 
-Before both paths grow further, pick one contract:
+- **Ports** (`internal/hft/domain`): `Source` (streams events), `Fanout`
+  (broadcast), `Snapshotter` (state), `Sink` (persistence).
+- **Adapters**: `infra/binance` implements `Source` and owns decoding plus the
+  injectable `Dialer`; `infra/memstore` implements `Snapshotter`; the WS and
+  HTTP transports are pure adapters over those ports.
+- **Wiring** (`internal/app`): a Binance source feeds the memstore and the
+  fan-out from one emit callback, so the read model and the live stream can
+  never disagree about what arrived.
 
-- **Option A** — keep `internal/hft/domain` as the shared model, extend it with
-  depth/kline kinds, and port `internal/market` onto it.
-- **Option B** — keep `internal/market` (this slice) as the runtime contract and
-  retire the duplicate Binance decoder.
+Price representation is deliberately split:
 
-Until then, expect two market models with incompatible price representations.
+- **Inside** the domain, prices and quantities are `int64` in the instrument's
+  minimal unit. This matches the matching engine and makes arithmetic exact.
+- **On the wire**, `internal/transport/wire.Decimal` renders those integers as
+  decimal strings. No `float64` is involved anywhere on the market-data path.
+
+Earlier in this branch there were two competing market-data packages
+(`internal/market` + `internal/gateway/binance` alongside `internal/hft/...`).
+They have been consolidated onto this one: the duplicate packages are gone, and
+their useful regression tests moved into `infra/binance`.

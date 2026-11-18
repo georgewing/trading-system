@@ -32,3 +32,15 @@ type Fanout interface {
 	Publish(ev Event)
 	Subscribe(topics []string) (<-chan Event, func(), error)
 }
+
+// Snapshotter serves the current state for stateful topics. Streams deliver
+// deltas and single events; a client that just connected needs a full picture
+// before it can apply them.
+//
+// Implementations keep bounded history, so a nil or short result is not an
+// error: it only means the server has not seen that data yet.
+type Snapshotter interface {
+	Depth(symbol string) (Depth, bool)
+	Trades(symbol string, limit int) []Trade
+	Klines(symbol, interval string, limit int) []Kline
+}

@@ -8,9 +8,11 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
-	"trading-system/internal/market"
+	"trading-system/internal/hft/domain"
 	"trading-system/internal/orders"
+	"trading-system/internal/transport/wire"
 )
 
 const (
@@ -21,13 +23,6 @@ const (
 	defaultOrdersLimit = 100
 	maxOrdersLimit     = 500
 )
-
-// MarketReader is the snapshot surface backed by market.Store.
-type MarketReader interface {
-	Depth(symbol string) (market.Depth, bool)
-	Trades(symbol string, limit int) []market.Trade
-	Klines(symbol, interval string, limit int) []market.Kline
-}
 
 // OrderReader is the query surface backed by orders.Book.
 type OrderReader interface {
@@ -59,20 +54,52 @@ func MakeMetaEndpoint(symbol string, pricePrecision, quantityPrecision int) http
 	})
 }
 
+// depthResponse mirrors the WebSocket depth payload so both transports can
+// share one client-side type.
+type depthResponse struct {
+	Symbol       string      `json:"symbol"`
+	LastUpdateID uint64      `json:"last_update_id"`
+	Bids         [][2]string `json:"bids"`
+	Asks         [][2]string `json:"asks"`
+	Ts           int64       `json:"ts"`
+}
+
+type marketTradeResponse struct {
+	ID     uint64 `json:"id"`
+	Symbol string `json:"symbol"`
+	Price  string `json:"price"`
+	Qty    string `json:"qty"`
+	Side   string `json:"side"`
+	Ts     int64  `json:"ts"`
+}
+
+type klineResponse struct {
+	Symbol   string `json:"symbol"`
+	Interval string `json:"interval"`
+	OpenTime int64  `json:"open_time"`
+	Open     string `json:"open"`
+	High     string `json:"high"`
+	Low      string `json:"low"`
+	Close    string `json:"close"`
+	Volume   string `json:"volume"`
+	Closed   bool   `json:"closed"`
+	Ts       int64  `json:"ts"`
+}
+
 // MakeDepthEndpoint serves GET /api/v1/market/depth.
-func MakeDepthEndpoint(feed MarketReader, defaultSymbol string) http.Handler {
+func MakeDepthEndpoint(snap domain.Snapshotter, defaultSymbol string, pricePrecision, qtyPrecision int) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
 			writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 			return
 		}
-		if feed == nil {
+		if snap == nil {
 			writeError(w, http.StatusServiceUnavailable, "market data unavailable")
 			return
 		}
 
 		symbol := querySymbol(r, defaultSymbol)
-		depth, ok := feed.Depth(symbol)
+		depth, ok := snap.Depth(symbol)
 		if !ok {
 			writeError(w, http.StatusServiceUnavailable, "market data not ready for "+symbol)
 			return
@@ -86,18 +113,32 @@ func MakeDepthEndpoint(feed MarketReader, defaultSymbol string) http.Handler {
 			depth.Asks = depth.Asks[:limit]
 		}
 
-		writeJSON(w, http.StatusOK, depth)
+		resp := depthResponse{
+			Symbol:       symbol,
+			LastUpdateID: depth.UpdateID,
+			Bids:         make([][2]string, 0, len(depth.Bids)),
+			Asks:         make([][2]string, 0, len(depth.Asks)),
+			Ts:           time.Now().UnixMilli(),
+		}
+		for _, lv := range depth.Bids {
+			resp.Bids = append(resp.Bids, wire.Level(lv.Price, lv.Qty, pricePrecision, qtyPrecision))
+		}
+		for _, lv := range depth.Asks {
+			resp.Asks = append(resp.Asks, wire.Level(lv.Price, lv.Qty, pricePrecision, qtyPrecision))
+		}
+
+		writeJSON(w, http.StatusOK, resp)
 	})
 }
 
 // MakeTradesEndpoint serves GET /api/v1/market/trades.
-func MakeTradesEndpoint(feed MarketReader, defaultSymbol string) http.Handler {
+func MakeTradesEndpoint(snap domain.Snapshotter, defaultSymbol string, pricePrecision, qtyPrecision int) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
 			writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 			return
 		}
-		if feed == nil {
+		if snap == nil {
 			writeError(w, http.StatusServiceUnavailable, "market data unavailable")
 			return
 		}
@@ -105,21 +146,35 @@ func MakeTradesEndpoint(feed MarketReader, defaultSymbol string) http.Handler {
 		symbol := querySymbol(r, defaultSymbol)
 		limit := queryLimit(r, 100, 500)
 
-		writeJSON(w, http.StatusOK, map[string]any{
-			"symbol": symbol,
-			"trades": feed.Trades(symbol, limit),
-		})
+		trades := snap.Trades(symbol, limit)
+		out := make([]marketTradeResponse, 0, len(trades))
+		for _, t := range trades {
+			side := "BUY"
+			if t.BuyerIsMaker {
+				side = "SELL"
+			}
+			out = append(out, marketTradeResponse{
+				ID:     t.ID,
+				Symbol: symbol,
+				Price:  wire.Decimal(t.Price, pricePrecision),
+				Qty:    wire.Decimal(t.Qty, qtyPrecision),
+				Side:   side,
+				Ts:     t.TS,
+			})
+		}
+
+		writeJSON(w, http.StatusOK, map[string]any{"symbol": symbol, "trades": out})
 	})
 }
 
 // MakeKlineEndpoint serves GET /api/v1/market/kline.
-func MakeKlineEndpoint(feed MarketReader, defaultSymbol string) http.Handler {
+func MakeKlineEndpoint(snap domain.Snapshotter, defaultSymbol string, pricePrecision, qtyPrecision int) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
 			writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 			return
 		}
-		if feed == nil {
+		if snap == nil {
 			writeError(w, http.StatusServiceUnavailable, "market data unavailable")
 			return
 		}
@@ -131,10 +186,27 @@ func MakeKlineEndpoint(feed MarketReader, defaultSymbol string) http.Handler {
 		}
 		limit := queryLimit(r, defaultKlineLimit, maxKlineLimit)
 
+		klines := snap.Klines(symbol, interval, limit)
+		out := make([]klineResponse, 0, len(klines))
+		for _, k := range klines {
+			out = append(out, klineResponse{
+				Symbol:   symbol,
+				Interval: k.Interval,
+				OpenTime: k.OpenTime,
+				Open:     wire.Decimal(k.Open, pricePrecision),
+				High:     wire.Decimal(k.High, pricePrecision),
+				Low:      wire.Decimal(k.Low, pricePrecision),
+				Close:    wire.Decimal(k.Close, pricePrecision),
+				Volume:   wire.Decimal(k.Volume, qtyPrecision),
+				Closed:   k.Closed,
+				Ts:       k.OpenTime,
+			})
+		}
+
 		writeJSON(w, http.StatusOK, map[string]any{
 			"symbol":   symbol,
 			"interval": interval,
-			"klines":   feed.Klines(symbol, interval, limit),
+			"klines":   out,
 		})
 	})
 }
@@ -151,7 +223,6 @@ func MakeOrdersEndpoint(book OrderReader) http.Handler {
 			return
 		}
 
-		// /api/v1/orders/{order_id}
 		if rawID := strings.TrimPrefix(r.URL.Path, "/api/v1/orders/"); rawID != "" && rawID != r.URL.Path {
 			id, err := strconv.ParseUint(rawID, 10, 64)
 			if err != nil {

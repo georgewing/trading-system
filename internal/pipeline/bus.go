@@ -62,6 +62,14 @@ type EventBus struct {
 	// riskGuard 为可选的事前风控阶段，nil 表示关闭；只在处理 goroutine 读取。
 	riskGuard         RiskGuard
 	riskQuantityScale int64
+	riskPriceScale    int64
+
+	// riskObserver 为可选的事中风控观察者，nil 表示关闭；只在处理 goroutine 调用。
+	riskObserver RiskObserver
+
+	// venueResolver is the optional routing stage. nil means orders go straight
+	// to the matcher. It is only read on the processing goroutine.
+	venueResolver VenueResolver
 
 	accepting       atomic.Bool
 	processing      atomic.Int64
@@ -232,21 +240,69 @@ func (b *EventBus) processCommand(ctx context.Context, cmd OrderCommand) {
 		return
 	}
 
-	matchStart := time.Now()
-	result, matchErr := b.matcher.SubmitOrderDetailed(ctx, cmd.Order)
-	if matchErr != nil {
-		b.metrics.ObserveMatchLatency("error", time.Since(matchStart))
-	} else {
-		b.metrics.ObserveMatchLatency("ok", time.Since(matchStart))
+	// Routing is optional: without a resolver the bus keeps executing directly
+	// against the matcher.
+	if resolver := b.venueResolver; resolver != nil {
+		venue, routeErr := resolver.Route(cmd.Order.Symbol)
+		if routeErr != nil {
+			b.rejectCommand(ctx, cmd, routingRejectReason(routeErr))
+			return
+		}
+		if venue == nil {
+			b.rejectCommand(ctx, cmd, routingRejectReason(errNilVenue))
+			return
+		}
+
+		// Notify only after routing succeeds: a routing rejection never reaches
+		// the venue and must not leave an open-order slot behind.
+		b.notifyAccepted(cmd.Order)
+
+		submitStart := time.Now()
+		result, submitErr := venue.Submit(ctx, cmd.Order)
+		b.observeSubmitLatency(submitStart, submitErr)
+		b.publishResult(ctx, cmd, result, submitErr, venue.Name())
+		return
 	}
 
+	b.notifyAccepted(cmd.Order)
+
+	submitStart := time.Now()
+	result, matchErr := b.matcher.SubmitOrderDetailed(ctx, cmd.Order)
+	b.observeSubmitLatency(submitStart, matchErr)
+	b.publishResult(ctx, cmd, result, matchErr, "internal")
+}
+
+func (b *EventBus) notifyAccepted(order engine.Order) {
+	if b.riskObserver != nil {
+		b.riskObserver.OnOrderAccepted(order)
+	}
+}
+
+// observeSubmitLatency records matcher or venue submission time. Routing and
+// risk are excluded so the metric keeps meaning submit latency.
+func (b *EventBus) observeSubmitLatency(start time.Time, err error) {
+	if err != nil {
+		b.metrics.ObserveMatchLatency("error", time.Since(start))
+		return
+	}
+	b.metrics.ObserveMatchLatency("ok", time.Since(start))
+}
+
+// publishResult delivers the synchronous submit result and enqueues the exec
+// reports derived from it. Both the direct matcher path and the routed venue
+// path share it so report semantics stay identical.
+func (b *EventBus) publishResult(ctx context.Context, cmd OrderCommand, result engine.SubmitResult, submitErr error, venue string) {
 	b.sendResult(ctx, cmd.ResultCh, MatchResult{
 		Trades: result.Trades,
-		Err:    matchErr,
+		Err:    submitErr,
 	})
 
-	reports := buildExecReports(cmd.Order, result, matchErr)
-	for _, report := range reports {
+	for _, report := range buildExecReports(cmd.Order, result, submitErr, venue) {
+		// Account for fills before enqueueing: outbound enqueue can drop under
+		// backpressure, but positions and risk state must not.
+		if b.riskObserver != nil {
+			b.riskObserver.OnExecReport(cmd.Order, report)
+		}
 		if err := b.enqueueReport(ctx, report); err != nil {
 			logEnqueueFailure(report, err)
 		}
@@ -295,36 +351,24 @@ func (b *EventBus) enqueueReport(ctx context.Context, report engine.ExecReport) 
 	}
 }
 
-func buildExecReports(order engine.Order, result engine.SubmitResult, matchErr error) []engine.ExecReport {
+func buildExecReports(order engine.Order, result engine.SubmitResult, matchErr error, venue string) []engine.ExecReport {
 	now := time.Now().UnixNano()
 
 	if matchErr != nil {
 		return []engine.ExecReport{
-			{
-				OrderID:   order.ID,
-				Status:    engine.OrderStatusRejected,
-				Filled:    0,
-				Leaves:    0,
-				Reason:    matchErr.Error(),
-				Timestamp: now,
-			},
+			newExecReport(order, venue, 1, now, engine.ExecTypeRejected, engine.OrderStatusRejected, 0, 0, 0, 0, matchErr.Error(), nil),
 		}
 	}
 
 	if len(result.Trades) == 0 {
 		reason := ""
-		if result.CanceledQty > 0 {
+		execType := engine.ExecTypeNew
+		if result.CanceledQty > 0 || result.FinalStatus == engine.OrderStatusCanceled {
 			reason = "remaining quantity canceled by order policy"
+			execType = engine.ExecTypeCanceled
 		}
 		return []engine.ExecReport{
-			{
-				OrderID:   order.ID,
-				Status:    result.FinalStatus,
-				Filled:    0,
-				Leaves:    result.OpenLeaves,
-				Reason:    reason,
-				Timestamp: now,
-			},
+			newExecReport(order, venue, 1, now, execType, result.FinalStatus, 0, 0, 0, result.OpenLeaves, reason, nil),
 		}
 	}
 
@@ -345,18 +389,71 @@ func buildExecReports(order engine.Order, result engine.SubmitResult, matchErr e
 		}
 
 		trCopy := tr
-		reports = append(reports, engine.ExecReport{
-			OrderID:   order.ID,
-			Status:    status,
-			Filled:    cumFilled,
-			Leaves:    result.OpenLeaves,
-			Trade:     &trCopy,
-			Reason:    reason,
-			Timestamp: tr.Timestamp,
-		})
+		ts := tr.Timestamp
+		if ts == 0 {
+			ts = now
+		}
+		reports = append(reports, newExecReport(
+			order, venue, uint64(i+1), ts, engine.ExecTypeTrade, status,
+			cumFilled, tr.Price, tr.Quantity, result.OpenLeaves,
+			reason, &trCopy,
+		))
 	}
 
 	return reports
+}
+
+var execIDSeq atomic.Uint64
+
+func init() {
+	execIDSeq.Store(uint64(time.Now().UnixNano()))
+}
+
+func nextExecID() uint64 {
+	return execIDSeq.Add(1)
+}
+
+func newExecReport(
+	order engine.Order,
+	venue string,
+	seq uint64,
+	ts int64,
+	execType engine.ExecType,
+	status engine.OrderStatus,
+	cumQty, lastPx, lastQty, leavesQty int64,
+	reason string,
+	trade *engine.Trade,
+) engine.ExecReport {
+	liquidity := engine.Liquidity("")
+	if trade != nil {
+		liquidity = engine.LiquidityTaker
+	}
+	return engine.ExecReport{
+		ExecID:        nextExecID(),
+		Seq:           seq,
+		OrderID:       order.ID,
+		ClientOrderID: order.ClientOrderID,
+		AccountID:     order.AccountID,
+		Symbol:        order.Symbol,
+		Side:          order.Side,
+		ExecType:      execType,
+		Status:        status,
+		Filled:        cumQty,
+		Leaves:        leavesQty,
+		LastPx:        lastPx,
+		LastQty:       lastQty,
+		CumQty:        cumQty,
+		LeavesQty:     leavesQty,
+		Liquidity:     liquidity,
+		OrderPx:       order.Price,
+		OrderType:     order.Type,
+		TIF:           order.TIF,
+		Quantity:      order.Quantity,
+		Trade:         trade,
+		Reason:        reason,
+		Venue:         venue,
+		Timestamp:     ts,
+	}
 }
 
 func logEnqueueFailure(report engine.ExecReport, err error) {

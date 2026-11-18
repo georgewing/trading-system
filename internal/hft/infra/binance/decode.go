@@ -3,8 +3,8 @@
 //
 // Decoding is pure: it takes a raw frame and returns a domain.Event, so it can
 // be covered by table-driven tests using recorded frames without any network
-// access. Only trade prints and best-bid-offer updates are ingested in the
-// current phase; depth deltas are intentionally ignored.
+// access. Trade prints, BBO updates, top-N depth snapshots and klines are
+// decoded; incremental depth deltas are intentionally ignored.
 package binance
 
 import (
@@ -29,6 +29,10 @@ const Exchange = "binance"
 type Decoder struct {
 	PriceScale int64
 	QtyScale   int64
+	// Symbol is the fallback symbol for frames that do not carry one. Depth
+	// snapshot frames are symbol-less by design, so it is resolved from the
+	// stream name first and from this field otherwise.
+	Symbol string
 	// Now supplies receive timestamps; nil means time.Now.
 	Now func() time.Time
 }
@@ -54,6 +58,10 @@ func (d Decoder) Decode(raw []byte) (ev domain.Event, ok bool, err error) {
 		return d.decodeTrade(payload, now)
 	case strings.HasSuffix(stream, "@bookTicker"):
 		return d.decodeBookTicker(payload, now)
+	case strings.Contains(stream, "@depth"):
+		return d.decodeDepth(payload, stream, now)
+	case strings.Contains(stream, "@kline_"):
+		return d.decodeKline(payload, stream, now)
 	}
 
 	// No stream name (single-stream socket): sniff the payload instead.
@@ -72,6 +80,11 @@ func (d Decoder) Decode(raw []byte) (ev domain.Event, ok bool, err error) {
 			// Not subscribed in this phase; ignore instead of counting an error.
 			return domain.Event{}, false, nil
 		}
+	}
+
+	// A partial-book depth snapshot carries lastUpdateId and no event type.
+	if _, ok := probe["lastUpdateId"]; ok {
+		return d.decodeDepth(payload, stream, now)
 	}
 
 	// BBO frames carry `b`/`a` as decimal strings.
@@ -141,6 +154,7 @@ func (d Decoder) decodeTrade(payload []byte, now time.Time) (domain.Event, bool,
 			Price:        price,
 			Qty:          qty,
 			BuyerIsMaker: f.IsMaker,
+			TS:           ts,
 		},
 	}, true, nil
 }
@@ -214,4 +228,178 @@ func (d Decoder) now() time.Time {
 		return d.Now()
 	}
 	return time.Now()
+}
+
+// depthFrame is a partial book depth snapshot (`<symbol>@depth<N>`). It carries
+// no symbol and no event time, so both are filled in from the stream name and
+// the local clock.
+type depthFrame struct {
+	LastUpdateID uint64      `json:"lastUpdateId"`
+	Bids         [][2]string `json:"bids"`
+	Asks         [][2]string `json:"asks"`
+}
+
+func (d Decoder) decodeDepth(payload []byte, stream string, now time.Time) (domain.Event, bool, error) {
+	var f depthFrame
+	if err := json.Unmarshal(payload, &f); err != nil {
+		return domain.Event{}, false, fmt.Errorf("binance: decode depth: %w", err)
+	}
+
+	symbol := symbolFromStream(stream)
+	if symbol == "" {
+		symbol = d.Symbol
+	}
+	if symbol == "" {
+		return domain.Event{}, false, fmt.Errorf("binance: depth frame without symbol")
+	}
+
+	bids, err := d.levels("bid", f.Bids)
+	if err != nil {
+		return domain.Event{}, false, err
+	}
+	asks, err := d.levels("ask", f.Asks)
+	if err != nil {
+		return domain.Event{}, false, err
+	}
+
+	recvMS := now.UnixMilli()
+	return domain.Event{
+		Kind:     domain.KindDepth,
+		Exchange: Exchange,
+		Symbol:   symbol,
+		Seq:      f.LastUpdateID,
+		TS:       recvMS,
+		RecvTS:   recvMS,
+		Depth: &domain.Depth{
+			UpdateID: f.LastUpdateID,
+			Bids:     bids,
+			Asks:     asks,
+		},
+	}, true, nil
+}
+
+func (d Decoder) levels(side string, raw [][2]string) ([]domain.Level, error) {
+	out := make([]domain.Level, 0, len(raw))
+	for _, lv := range raw {
+		price, err := d.scaled(side+" price", lv[0], d.PriceScale)
+		if err != nil {
+			return nil, err
+		}
+		qty, err := d.scaled(side+" quantity", lv[1], d.QtyScale)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, domain.Level{Price: price, Qty: qty})
+	}
+	return out, nil
+}
+
+// klineFrame is a kline payload.
+//
+// Every key is declared explicitly. Binance mixes cases inside this object
+// ("L" last trade id vs "l" low, "V" taker-buy volume vs "v" volume), and
+// encoding/json falls back to a case-insensitive match for undeclared keys,
+// which silently decodes the wrong field.
+type klineFrame struct {
+	EventType string `json:"e"`
+	EventTime int64  `json:"E"`
+	Symbol    string `json:"s"`
+	Kline     struct {
+		OpenTime      int64  `json:"t"`
+		CloseTime     int64  `json:"T"`
+		Symbol        string `json:"s"`
+		Interval      string `json:"i"`
+		FirstTradeID  int64  `json:"f"`
+		LastTradeID   int64  `json:"L"`
+		Open          string `json:"o"`
+		Close         string `json:"c"`
+		High          string `json:"h"`
+		Low           string `json:"l"`
+		Volume        string `json:"v"`
+		Trades        int64  `json:"n"`
+		Closed        bool   `json:"x"`
+		QuoteVolume   string `json:"q"`
+		TakerBuyBase  string `json:"V"`
+		TakerBuyQuote string `json:"Q"`
+	} `json:"k"`
+}
+
+func (d Decoder) decodeKline(payload []byte, stream string, now time.Time) (domain.Event, bool, error) {
+	var f klineFrame
+	if err := json.Unmarshal(payload, &f); err != nil {
+		return domain.Event{}, false, fmt.Errorf("binance: decode kline: %w", err)
+	}
+
+	symbol := f.Kline.Symbol
+	if symbol == "" {
+		symbol = f.Symbol
+	}
+	if symbol == "" {
+		symbol = symbolFromStream(stream)
+	}
+	if symbol == "" {
+		symbol = d.Symbol
+	}
+	if symbol == "" {
+		return domain.Event{}, false, fmt.Errorf("binance: kline frame without symbol")
+	}
+	if f.Kline.Interval == "" {
+		return domain.Event{}, false, fmt.Errorf("binance: kline frame without interval")
+	}
+
+	open, err := d.scaled("kline open", f.Kline.Open, d.PriceScale)
+	if err != nil {
+		return domain.Event{}, false, err
+	}
+	high, err := d.scaled("kline high", f.Kline.High, d.PriceScale)
+	if err != nil {
+		return domain.Event{}, false, err
+	}
+	low, err := d.scaled("kline low", f.Kline.Low, d.PriceScale)
+	if err != nil {
+		return domain.Event{}, false, err
+	}
+	closePrice, err := d.scaled("kline close", f.Kline.Close, d.PriceScale)
+	if err != nil {
+		return domain.Event{}, false, err
+	}
+	volume, err := d.scaled("kline volume", f.Kline.Volume, d.QtyScale)
+	if err != nil {
+		return domain.Event{}, false, err
+	}
+
+	recvMS := now.UnixMilli()
+	ts := f.EventTime
+	if ts <= 0 {
+		ts = recvMS
+	}
+
+	return domain.Event{
+		Kind:     domain.KindKline,
+		Exchange: Exchange,
+		Symbol:   symbol,
+		Seq:      uint64(f.Kline.OpenTime),
+		TS:       ts,
+		RecvTS:   recvMS,
+		Kline: &domain.Kline{
+			Interval: f.Kline.Interval,
+			OpenTime: f.Kline.OpenTime,
+			Open:     open,
+			High:     high,
+			Low:      low,
+			Close:    closePrice,
+			Volume:   volume,
+			Closed:   f.Kline.Closed,
+		},
+	}, true, nil
+}
+
+// symbolFromStream extracts the symbol from a stream name such as
+// "btcusdt@depth20@100ms" and returns it upper-cased.
+func symbolFromStream(stream string) string {
+	i := strings.IndexByte(stream, '@')
+	if i <= 0 {
+		return ""
+	}
+	return strings.ToUpper(stream[:i])
 }

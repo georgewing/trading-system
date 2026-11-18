@@ -14,8 +14,12 @@ const (
 	// KindTrade is an executed trade print.
 	KindTrade Kind = iota + 1
 	// KindTick is a best-bid-offer (BBO) update. Depth increments are out of
-	// scope for the current phase; only the top of book is ingested.
+	// scope; the gateway ingests full top-N depth snapshots as KindDepth.
 	KindTick
+	// KindDepth is a full top-N order book snapshot.
+	KindDepth
+	// KindKline is one OHLCV candle update for a symbol and interval.
+	KindKline
 )
 
 // String returns the stable topic segment used by subscriptions and metrics.
@@ -25,6 +29,10 @@ func (k Kind) String() string {
 		return "trade"
 	case KindTick:
 		return "tick"
+	case KindDepth:
+		return "depth"
+	case KindKline:
+		return "kline"
 	default:
 		return "unknown"
 	}
@@ -46,11 +54,17 @@ type Event struct {
 	RecvTS   int64
 	Trade    *Trade
 	Tick     *Tick
+	Depth    *Depth
+	Kline    *Kline
 }
 
-// Topic returns the subscription key for the event, shaped as "kind:symbol"
-// (for example "trade:BTCUSDT").
+// Topic returns the subscription key for the event. Trade, tick and depth use
+// "kind:symbol"; kline adds the interval so one symbol can have several
+// candle streams: "kline:BTCUSDT:1m".
 func (e Event) Topic() string {
+	if e.Kind == KindKline && e.Kline != nil && e.Kline.Interval != "" {
+		return e.Kind.String() + ":" + e.Symbol + ":" + e.Kline.Interval
+	}
 	return e.Kind.String() + ":" + e.Symbol
 }
 
@@ -59,7 +73,8 @@ type Trade struct {
 	ID           uint64 // exchange trade id
 	Price        int64
 	Qty          int64
-	BuyerIsMaker bool // true when the buyer was the resting side
+	BuyerIsMaker bool  // true when the buyer was the resting side
+	TS           int64 // exchange trade time, unix milliseconds
 }
 
 // Tick is a best-bid-offer update. Exchanges such as Binance publish no event
@@ -70,4 +85,32 @@ type Tick struct {
 	BidQty   int64
 	AskPrice int64
 	AskQty   int64
+}
+
+// Level is one price level of a depth snapshot.
+type Level struct {
+	Price int64
+	Qty   int64
+}
+
+// Depth is a full top-N order book snapshot. Bids are ordered best-first
+// (descending price) and asks ascending, as published by the venue.
+type Depth struct {
+	UpdateID uint64
+	Bids     []Level
+	Asks     []Level
+}
+
+// Kline is one OHLCV candle. OpenTime and the prices/volume are in the same
+// conventions as the rest of the package: millisecond timestamps and minimal
+// units.
+type Kline struct {
+	Interval string
+	OpenTime int64
+	Open     int64
+	High     int64
+	Low      int64
+	Close    int64
+	Volume   int64
+	Closed   bool
 }

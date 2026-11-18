@@ -150,22 +150,58 @@ func validateTopic(topic string) error {
 	if topic == "*" {
 		return nil
 	}
-	i := strings.IndexByte(topic, ':')
-	if i <= 0 || i == len(topic)-1 {
-		return fmt.Errorf("%w: %q", ErrBadTopic, topic)
-	}
 
-	symbol := topic[i+1:]
-	if symbol == "*" {
-		// "trade:*" is accepted once the kind is known.
-	} else if strings.ContainsAny(symbol, ":* ") {
-		return fmt.Errorf("%w: %q", ErrBadTopic, topic)
-	}
+	parts := strings.Split(topic, ":")
+	kind := parts[0]
 
-	switch topic[:i] {
-	case KindTrade.String(), KindTick.String():
+	switch len(parts) {
+	case 2:
+		switch kind {
+		case KindTrade.String(), KindTick.String(), KindDepth.String():
+			return validateSymbol(parts[1], topic)
+		case KindKline.String():
+			// "kline:*" subscribes to every candle stream; "kline:SYM" would
+			// silently match every interval for one symbol, so require the
+			// phaseful form instead.
+			if parts[1] == "*" {
+				return nil
+			}
+			return fmt.Errorf("%w: kline topic needs an interval: %q", ErrBadTopic, topic)
+		default:
+			return fmt.Errorf("%w: unknown kind in %q", ErrBadTopic, topic)
+		}
+
+	case 3:
+		if kind != KindKline.String() {
+			return fmt.Errorf("%w: %q", ErrBadTopic, topic)
+		}
+		// A wildcard symbol cannot be resolved against "kline:*" matching, so
+		// only the fully wildcard shape "kline:*" is supported.
+		if parts[1] == "*" {
+			return fmt.Errorf("%w: %q", ErrBadTopic, topic)
+		}
+		if err := validateSymbol(parts[1], topic); err != nil {
+			return err
+		}
+		if parts[2] == "" || strings.ContainsAny(parts[2], ":* ") {
+			return fmt.Errorf("%w: %q", ErrBadTopic, topic)
+		}
 		return nil
+
 	default:
-		return fmt.Errorf("%w: unknown kind in %q", ErrBadTopic, topic)
+		return fmt.Errorf("%w: %q", ErrBadTopic, topic)
 	}
+}
+
+func validateSymbol(symbol, topic string) error {
+	if symbol == "" {
+		return fmt.Errorf("%w: %q", ErrBadTopic, topic)
+	}
+	if symbol == "*" {
+		return nil
+	}
+	if strings.ContainsAny(symbol, ":* ") {
+		return fmt.Errorf("%w: %q", ErrBadTopic, topic)
+	}
+	return nil
 }

@@ -39,6 +39,26 @@ const (
 	OrderStatusRejected        OrderStatus = 5
 )
 
+// ExecType describes the execution event that produced a report. It is
+// intentionally separate from OrderStatus: an IOC order can have a final
+// ExecTypeCanceled while its OrderStatus remains PartiallyFilled.
+type ExecType string
+
+const (
+	ExecTypeNew      ExecType = "NEW"
+	ExecTypeTrade    ExecType = "TRADE"
+	ExecTypeCanceled ExecType = "CANCELED"
+	ExecTypeRejected ExecType = "REJECTED"
+)
+
+// Liquidity identifies whether the reported fill was maker or taker.
+type Liquidity string
+
+const (
+	LiquidityMaker Liquidity = "MAKER"
+	LiquidityTaker Liquidity = "TAKER"
+)
+
 // Order 订单结构体
 type Order struct {
 	ID            uint64 // 系统级唯一订单ID
@@ -110,13 +130,35 @@ type Trade struct {
 	MakerOrder  uint64 // maker order id
 }
 
-// ExecReport 为执行反馈/回报结构
+// ExecReport 为执行反馈/回报结构。
 type ExecReport struct {
-	OrderID   uint64
+	ExecID        uint64
+	Seq           uint64
+	OrderID       uint64
+	ClientOrderID string
+	AccountID     uint64
+	Symbol        string
+	Side          Side
+
+	ExecType  ExecType
 	Status    OrderStatus
 	Filled    int64
 	Leaves    int64
+	LastPx    int64
+	LastQty   int64
+	CumQty    int64
+	LeavesQty int64
+	Liquidity Liquidity
+
+	// Order metadata allows persistence sinks to upsert the order row without
+	// a separate lookup.
+	OrderPx   int64
+	OrderType OrderType
+	TIF       TimeInForce
+	Quantity  string
+
 	Trade     *Trade
 	Reason    string
+	Venue     string
 	Timestamp int64
 }

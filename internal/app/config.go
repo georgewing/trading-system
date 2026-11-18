@@ -11,6 +11,7 @@ type Config struct {
 	Matcher   MatcherConfig   `yaml:"matcher"`
 	Market    MarketConfig    `yaml:"market"`
 	Pipeline  PipelineConfig  `yaml:"pipeline"`
+	Routing   RoutingConfig   `yaml:"routing"`
 	Risk      RiskConfig      `yaml:"risk"`
 	Storage   StorageConfig   `yaml:"storage"`
 	WebSocket WebSocketConfig `yaml:"websocket"`
@@ -47,9 +48,17 @@ type MarketConfig struct {
 	StoreKlineCap int `yaml:"store_kline_cap"`
 }
 
-// StorageConfig holds datastore connection strings.
+// StorageConfig holds datastore connection strings and toggles. Writers are
+// disabled unless the corresponding Enabled flag is true, so the example config
+// can be used without local databases.
 type StorageConfig struct {
-	PostgresDSN string `yaml:"postgres_dsn"`
+	PostgresEnabled          bool   `yaml:"postgres_enabled"`
+	PostgresDSN              string `yaml:"postgres_dsn"`
+	ClickHouseEnabled        bool   `yaml:"clickhouse_enabled"`
+	ClickHouseURL            string `yaml:"clickhouse_url"`
+	ClickHouseDatabase       string `yaml:"clickhouse_database"`
+	ClickHouseTable          string `yaml:"clickhouse_table"`
+	ClickHouseTimeoutSeconds int    `yaml:"clickhouse_timeout_seconds"`
 }
 type WebSocketConfig struct {
 	BufferSize int `yaml:"buffer_size"`
@@ -60,8 +69,16 @@ type PipelineConfig struct {
 	OutboundCapacity uint64 `yaml:"outbound_capacity"`
 }
 
-// RiskConfig configures the optional pre-trade risk stage. Zero/empty values
-// disable the corresponding check; Enabled gates the whole stage.
+// RoutingConfig configures order-to-venue routing. Only the internal "paper"
+// venue exists today, so symbol_venues may only reference "paper". An empty
+// default_venue falls back to "paper".
+type RoutingConfig struct {
+	DefaultVenue string            `yaml:"default_venue"`
+	SymbolVenues map[string]string `yaml:"symbol_venues"`
+}
+
+// RiskConfig configures the optional risk stages. Zero/empty values disable the
+// corresponding check; Enabled gates the whole stage.
 type RiskConfig struct {
 	Enabled            bool     `yaml:"enabled"`
 	SymbolWhitelist    []string `yaml:"symbol_whitelist"`
@@ -71,6 +88,21 @@ type RiskConfig struct {
 	MaxOrdersPerWindow int      `yaml:"max_orders_per_window"`
 	WindowSeconds      int      `yaml:"window_seconds"`
 	MaxPosition        int64    `yaml:"max_position"`
+
+	Intraday IntradayRiskConfig `yaml:"intraday"`
+}
+
+// IntradayRiskConfig configures post-trade monitoring and strategy breakers.
+// Zero values disable the corresponding check.
+type IntradayRiskConfig struct {
+	MaxCancelRatioBps   int64 `yaml:"max_cancel_ratio_bps"`
+	CancelWindowSeconds int   `yaml:"cancel_window_seconds"`
+	MinCancelSamples    int   `yaml:"min_cancel_samples"`
+	MaxOpenOrders       int   `yaml:"max_open_orders"`
+	MaxDailyLoss        int64 `yaml:"max_daily_loss"`
+	MaxDrawdownBps      int64 `yaml:"max_drawdown_bps"`
+	CooldownSeconds     int   `yaml:"cooldown_seconds"`
+	ResumeAuto          bool  `yaml:"resume_auto"`
 }
 
 func Load(path string) (*Config, error) {

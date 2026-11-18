@@ -2,6 +2,7 @@ package observability
 
 import (
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -37,6 +38,12 @@ type PrometheusMetrics struct {
 	sinkFailures      *prometheus.CounterVec
 	wsDropped         prometheus.Counter
 	riskDecision      *prometheus.CounterVec
+	riskEvents        *prometheus.CounterVec
+	riskEventDropped  prometheus.Counter
+	strategyState     *prometheus.GaugeVec
+
+	stateMu     sync.Mutex
+	stateLabels map[string]string
 
 	feedMessages   *prometheus.CounterVec
 	feedReconnects *prometheus.CounterVec
@@ -57,7 +64,8 @@ func NewPrometheusMetrics(cfg PrometheusConfig) (*PrometheusMetrics, error) {
 
 	registry := prometheus.NewRegistry()
 	m := &PrometheusMetrics{
-		registry: registry,
+		registry:    registry,
+		stateLabels: make(map[string]string),
 		orderArrivalTotal: prometheus.NewCounterVec(
 			prometheus.CounterOpts{
 				Namespace: cfg.Namespace,
@@ -121,6 +129,32 @@ func NewPrometheusMetrics(cfg PrometheusConfig) (*PrometheusMetrics, error) {
 			},
 			[]string{"code", "result"},
 		),
+		riskEvents: prometheus.NewCounterVec(
+			prometheus.CounterOpts{
+				Namespace: cfg.Namespace,
+				Subsystem: cfg.Subsystem,
+				Name:      "risk_events_total",
+				Help:      "Total number of risk events by code and action.",
+			},
+			[]string{"code", "action"},
+		),
+		riskEventDropped: prometheus.NewCounter(
+			prometheus.CounterOpts{
+				Namespace: cfg.Namespace,
+				Subsystem: cfg.Subsystem,
+				Name:      "risk_event_dropped_total",
+				Help:      "Total number of risk events dropped by the async sink.",
+			},
+		),
+		strategyState: prometheus.NewGaugeVec(
+			prometheus.GaugeOpts{
+				Namespace: cfg.Namespace,
+				Subsystem: cfg.Subsystem,
+				Name:      "strategy_state",
+				Help:      "Current strategy state (1 for the active state label).",
+			},
+			[]string{"strategy", "state"},
+		),
 		feedMessages: prometheus.NewCounterVec(
 			prometheus.CounterOpts{
 				Namespace: cfg.Namespace,
@@ -178,6 +212,15 @@ func NewPrometheusMetrics(cfg PrometheusConfig) (*PrometheusMetrics, error) {
 		return nil, err
 	}
 	if err := registry.Register(m.riskDecision); err != nil {
+		return nil, err
+	}
+	if err := registry.Register(m.riskEvents); err != nil {
+		return nil, err
+	}
+	if err := registry.Register(m.riskEventDropped); err != nil {
+		return nil, err
+	}
+	if err := registry.Register(m.strategyState); err != nil {
 		return nil, err
 	}
 	if err := registry.Register(m.feedMessages); err != nil {
@@ -265,6 +308,51 @@ func (m *PrometheusMetrics) IncRiskDecision(code, result string) {
 	m.riskDecision.WithLabelValues(code, result).Inc()
 }
 
+// IncRiskEvent records one risk event emitted by the risk engine.
+func (m *PrometheusMetrics) IncRiskEvent(code, action string) {
+	if m == nil {
+		return
+	}
+	if code == "" {
+		code = "unknown"
+	}
+	if action == "" {
+		action = "unknown"
+	}
+	m.riskEvents.WithLabelValues(code, action).Inc()
+}
+
+// IncRiskEventDrop records one event dropped by the async risk sink.
+func (m *PrometheusMetrics) IncRiskEventDrop() {
+	if m == nil {
+		return
+	}
+	m.riskEventDropped.Inc()
+}
+
+// SetStrategyState sets the state gauge for a strategy and clears its previous
+// state so exactly one state label reads 1 per strategy.
+func (m *PrometheusMetrics) SetStrategyState(strategy, state string) {
+	if m == nil {
+		return
+	}
+	if strategy == "" {
+		strategy = "default"
+	}
+	if state == "" {
+		state = "unknown"
+	}
+
+	m.stateMu.Lock()
+	defer m.stateMu.Unlock()
+
+	if prev, ok := m.stateLabels[strategy]; ok && prev != state {
+		m.strategyState.WithLabelValues(strategy, prev).Set(0)
+	}
+	m.stateLabels[strategy] = state
+	m.strategyState.WithLabelValues(strategy, state).Set(1)
+}
+
 // IncFeedMessage records one decoded market-data message.
 func (m *PrometheusMetrics) IncFeedMessage(stream string) {
 	if m == nil {
@@ -278,13 +366,18 @@ func (m *PrometheusMetrics) IncFeedMessage(stream string) {
 
 // IncFeedReconnect records one market-data reconnect attempt.
 func (m *PrometheusMetrics) IncFeedReconnect(provider string) {
-	if m == nil {
+	m.AddFeedReconnect(provider, 1)
+}
+
+// AddFeedReconnect records n market-data reconnect attempts.
+func (m *PrometheusMetrics) AddFeedReconnect(provider string, n uint64) {
+	if m == nil || n == 0 {
 		return
 	}
 	if provider == "" {
 		provider = "unknown"
 	}
-	m.feedReconnects.WithLabelValues(provider).Inc()
+	m.feedReconnects.WithLabelValues(provider).Add(float64(n))
 }
 
 // SetFeedLag records the current feed delay for a stream.
@@ -300,13 +393,18 @@ func (m *PrometheusMetrics) SetFeedLag(stream string, d time.Duration) {
 
 // IncFeedDrop records a market-data event dropped for a slow subscriber.
 func (m *PrometheusMetrics) IncFeedDrop(topic string) {
-	if m == nil {
+	m.AddFeedDrop(topic, 1)
+}
+
+// AddFeedDrop records n market-data events dropped for slow subscribers.
+func (m *PrometheusMetrics) AddFeedDrop(topic string, n uint64) {
+	if m == nil || n == 0 {
 		return
 	}
 	if topic == "" {
 		topic = "unknown"
 	}
-	m.feedDropped.WithLabelValues(topic).Inc()
+	m.feedDropped.WithLabelValues(topic).Add(float64(n))
 }
 
 func (m *PrometheusMetrics) Handler() http.Handler {

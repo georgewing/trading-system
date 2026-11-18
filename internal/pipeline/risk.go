@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
+	"math/bits"
 
 	"trading-system/internal/engine"
 	"trading-system/internal/risk"
@@ -13,6 +15,14 @@ import (
 // implemented by *risk.Guard; tests may provide a fake.
 type RiskGuard interface {
 	Check(ctx context.Context, req risk.Request) risk.Decision
+}
+
+// RiskObserver receives accepted orders and their execution reports so a risk
+// engine can maintain positions. It is called on the matching goroutine, before
+// reports are enqueued outbound; implementations must be non-blocking.
+type RiskObserver interface {
+	OnOrderAccepted(order engine.Order)
+	OnExecReport(order engine.Order, report engine.ExecReport)
 }
 
 // Results reported to observability.Recorder.IncRiskDecision.
@@ -33,6 +43,22 @@ func (b *EventBus) SetRiskGuard(guard RiskGuard, quantityScale int64) {
 	}
 	b.riskGuard = guard
 	b.riskQuantityScale = quantityScale
+}
+
+// SetRiskPriceScale supplies the price multiplier so the risk stage can report
+// notional in quote units (price * qty / (priceScale * quantityScale)). Zero
+// keeps the legacy raw Price*Qty behavior.
+func (b *EventBus) SetRiskPriceScale(priceScale int64) {
+	if priceScale < 0 {
+		priceScale = 0
+	}
+	b.riskPriceScale = priceScale
+}
+
+// SetRiskObserver installs the optional post-trade observer. It is called on the
+// matching goroutine and must not block. Call it before Start.
+func (b *EventBus) SetRiskObserver(observer RiskObserver) {
+	b.riskObserver = observer
 }
 
 // checkRisk runs the pre-trade risk stage. It returns ("", true) when the order
@@ -59,6 +85,7 @@ func (b *EventBus) checkRisk(ctx context.Context, order engine.Order) (string, b
 		TIF:            order.TIF,
 		Price:          order.Price,
 		Qty:            qty,
+		Notional:       b.quoteNotional(order.Price, qty),
 		ReferencePrice: b.matcher.ReferencePrice(),
 	})
 
@@ -69,6 +96,32 @@ func (b *EventBus) checkRisk(ctx context.Context, order engine.Order) (string, b
 
 	b.metrics.IncRiskDecision(decision.Code, riskResultApproved)
 	return "", true
+}
+
+func (b *EventBus) quoteNotional(price, qty int64) int64 {
+	if b.riskPriceScale <= 0 || b.riskQuantityScale <= 0 || price <= 0 || qty <= 0 {
+		return 0
+	}
+	denom, ok := mulUint64(uint64(b.riskPriceScale), uint64(b.riskQuantityScale))
+	if !ok || denom == 0 {
+		return math.MaxInt64
+	}
+	hi, lo := bits.Mul64(uint64(price), uint64(qty))
+	if hi >= denom {
+		return math.MaxInt64
+	}
+	q, _ := bits.Div64(hi, lo, denom)
+	if q > math.MaxInt64 {
+		return math.MaxInt64
+	}
+	return int64(q)
+}
+
+func mulUint64(a, b uint64) (uint64, bool) {
+	if a != 0 && b > math.MaxUint64/a {
+		return 0, false
+	}
+	return a * b, true
 }
 
 // rejectionReason renders a risk decision as the ExecReport reason, always
@@ -91,7 +144,7 @@ func (b *EventBus) rejectCommand(ctx context.Context, cmd OrderCommand, reason s
 
 	b.sendResult(ctx, cmd.ResultCh, MatchResult{Err: rejectErr})
 
-	for _, report := range buildExecReports(cmd.Order, engine.SubmitResult{}, rejectErr) {
+	for _, report := range buildExecReports(cmd.Order, engine.SubmitResult{}, rejectErr, "") {
 		if err := b.enqueueReport(ctx, report); err != nil {
 			logEnqueueFailure(report, err)
 		}

@@ -26,25 +26,53 @@ pipeline:
   inbound_capacity: 1048576
   outbound_capacity: 1048576
 
-# Pre-trade risk checks. Disabled by default; zero/empty values disable
-# individual checks when enabled.
-# Limits use engine integer units:
-#   max_order_qty / max_position: lots (quantity * 10^quantity_precision)
-#   max_notional: price_ticks * qty_lots
-# max_position is evaluated against a zero in-memory position until an account
-# position source is wired.
+# Order routing between execution venues. The internal paper venue is the only
+# venue today; symbol_venues may only map to "paper". An empty default_venue
+# falls back to "paper".
+routing:
+  default_venue: "paper"
+  symbol_venues: {}
+  # Example: pin a symbol explicitly (the venue must be configured).
+  # symbol_venues:
+  #   BTCUSDT: "paper"
+
+# Risk checks. Disabled by default; zero/empty values disable individual checks
+# when enabled.
+# Limits use human-readable units and are converted to engine units at startup:
+#   max_order_qty / max_position: base quantity (e.g. BTC)
+#   max_notional / max_daily_loss: quote currency (e.g. USDT)
+# max_position is evaluated against the in-memory position ledger, which is fed
+# from execution reports on the matching goroutine.
 risk:
   enabled: false
   symbol_whitelist: []
   max_order_qty: 0
   max_notional: 0
-  price_band_bps: 0
+  price_band_bps: 0        # reference price comes from the live market mid
   max_orders_per_window: 0
   window_seconds: 0
   max_position: 0
 
+  # Post-trade monitoring and strategy breakers. When a check trips, new orders
+  # are rejected with the corresponding code and a risk event is published.
+  intraday:
+    max_cancel_ratio_bps: 0   # 8000 means 80% cancels over the window
+    cancel_window_seconds: 0
+    min_cancel_samples: 5     # avoid tripping on the first cancel
+    max_open_orders: 0
+    max_daily_loss: 0
+    max_drawdown_bps: 0
+    cooldown_seconds: 0
+    resume_auto: false        # false escalates a breach to a permanent halt
+
 storage:
+  postgres_enabled: false
   postgres_dsn: "postgres://user:pass@localhost:5432/trading?sslmode=disable"
+  clickhouse_enabled: false
+  clickhouse_url: "http://127.0.0.1:8123"
+  clickhouse_database: "market"
+  clickhouse_table: "trade_ticks"
+  clickhouse_timeout_seconds: 5
 
 websocket:
   buffer_size: 1024

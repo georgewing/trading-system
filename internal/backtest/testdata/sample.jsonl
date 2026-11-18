@@ -1,0 +1,14 @@
+{"ts":1700000000000,"symbol":"BTCUSDT","kind":"book","book":{"bids":[[10000,300000000]],"asks":[[10001,300000000]]}}
+{"ts":1700000030000,"symbol":"BTCUSDT","kind":"trade","trade":{"id":1,"price":9997,"qty":100000000}}
+{"ts":1700000060000,"symbol":"BTCUSDT","kind":"book","book":{"bids":[[10000,300000000]],"asks":[[10001,300000000]]}}
+{"ts":1700000090000,"symbol":"BTCUSDT","kind":"trade","trade":{"id":2,"price":10004,"qty":100000000}}
+{"ts":1700000120000,"symbol":"BTCUSDT","kind":"book","book":{"bids":[[10010,300000000]],"asks":[[10011,300000000]]}}
+{"ts":1700000150000,"symbol":"BTCUSDT","kind":"trade","trade":{"id":3,"price":10007,"qty":100000000}}
+{"ts":1700000180000,"symbol":"BTCUSDT","kind":"book","book":{"bids":[[10010,300000000]],"asks":[[10011,300000000]]}}
+{"ts":1700000210000,"symbol":"BTCUSDT","kind":"trade","trade":{"id":4,"price":10014,"qty":100000000}}
+{"ts":1700000240000,"symbol":"BTCUSDT","kind":"book","book":{"bids":[[10020,300000000]],"asks":[[10021,300000000]]}}
+{"ts":1700000270000,"symbol":"BTCUSDT","kind":"trade","trade":{"id":5,"price":10001,"qty":200000000}}
+{"ts":1700000300000,"symbol":"BTCUSDT","kind":"book","book":{"bids":[[10020,300000000]],"asks":[[10021,300000000]]}}
+{"ts":1700000330000,"symbol":"BTCUSDT","kind":"trade","trade":{"id":6,"price":10025,"qty":200000000}}
+{"ts":1700000360000,"symbol":"BTCUSDT","kind":"book","book":{"bids":[[10030,300000000]],"asks":[[10031,300000000]]}}
+{"ts":1700000390000,"symbol":"BTCUSDT","kind":"trade","trade":{"id":7,"price":10027,"qty":200000000}}

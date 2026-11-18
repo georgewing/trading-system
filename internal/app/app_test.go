@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -127,6 +128,52 @@ risk:
 	}
 }
 
+func TestLoadRoutingConfig(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	content := `
+routing:
+  default_venue: "paper"
+  symbol_venues:
+    BTCUSDT: "paper"
+    ETHUSDT: "paper"
+`
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+
+	if cfg.Routing.DefaultVenue != "paper" {
+		t.Fatalf("routing.default_venue = %q, want paper", cfg.Routing.DefaultVenue)
+	}
+	if len(cfg.Routing.SymbolVenues) != 2 {
+		t.Fatalf("routing.symbol_venues = %v, want 2 entries", cfg.Routing.SymbolVenues)
+	}
+	for symbol, want := range map[string]string{"BTCUSDT": "paper", "ETHUSDT": "paper"} {
+		if got := cfg.Routing.SymbolVenues[symbol]; got != want {
+			t.Fatalf("routing.symbol_venues[%s] = %q, want %q", symbol, got, want)
+		}
+	}
+}
+
+func TestLoadRejectsUnknownRoutingField(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	content := `
+routing:
+  default_venues: "paper"
+`
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	if _, err := Load(path); err == nil {
+		t.Fatal("Load() error = nil, want strict YAML error for unknown routing field")
+	}
+}
+
 func TestExampleConfigLoads(t *testing.T) {
 	cfg, err := Load(filepath.Join("..", "..", "configs", "config.example.yaml"))
 	if err != nil {
@@ -140,6 +187,13 @@ func TestExampleConfigLoads(t *testing.T) {
 		cfg.Risk.PriceBandBps != 0 || cfg.Risk.MaxOrdersPerWindow != 0 ||
 		cfg.Risk.WindowSeconds != 0 || cfg.Risk.MaxPosition != 0 {
 		t.Fatalf("example risk defaults = %+v, want zero values", cfg.Risk)
+	}
+
+	if cfg.Routing.DefaultVenue != "paper" {
+		t.Fatalf("example routing.default_venue = %q, want paper", cfg.Routing.DefaultVenue)
+	}
+	if len(cfg.Routing.SymbolVenues) != 0 {
+		t.Fatalf("example routing.symbol_venues = %v, want empty", cfg.Routing.SymbolVenues)
 	}
 }
 
@@ -174,6 +228,43 @@ func TestRunFailsWhenAPIAddrInUse(t *testing.T) {
 
 	if err := Run(ctx, cfg); err == nil {
 		t.Fatal("Run() error = nil, want bind error")
+	}
+}
+
+func TestRunFailsWhenRoutingConfigInvalid(t *testing.T) {
+	t.Setenv("SNOWFLAKE_WORKER_ID", "1")
+
+	cfg := &Config{
+		Server: ServerConfig{
+			APIAddr:     "127.0.0.1:0",
+			MetricsAddr: "127.0.0.1:0",
+		},
+		Matcher: MatcherConfig{
+			Symbol:            "BTCUSDT",
+			PricePrecision:    8,
+			QuantityPrecision: 8,
+		},
+		Pipeline: PipelineConfig{
+			InboundCapacity:  16,
+			OutboundCapacity: 16,
+		},
+		Routing: RoutingConfig{
+			DefaultVenue: "paper",
+			// No external venues are registered, so this mapping must fail.
+			SymbolVenues: map[string]string{"ETHUSDT": "binance"},
+		},
+		WebSocket: WebSocketConfig{BufferSize: 16},
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	err := Run(ctx, cfg)
+	if err == nil {
+		t.Fatal("Run() error = nil, want routing error for unknown venue")
+	}
+	if !strings.Contains(err.Error(), "unknown venue") {
+		t.Fatalf("Run() error = %v, want it to mention unknown venue", err)
 	}
 }
 
