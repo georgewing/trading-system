@@ -19,8 +19,8 @@ import (
 
 	"go.yaml.in/yaml/v2"
 
-	"trading-system/internal/backtest"
-	"trading-system/internal/strategy"
+	"trading-system/internal/hft/backtest"
+	"trading-system/internal/hft/strategy"
 )
 
 type fileConfig struct {

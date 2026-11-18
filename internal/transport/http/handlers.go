@@ -12,7 +12,7 @@ import (
 	"trading-system/internal/pipeline"
 	"trading-system/pkg/idgen"
 
-	"trading-system/internal/engine"
+	"trading-system/internal/hft/engine"
 )
 
 // 请求/响应结构体（OpenAPI 友好）

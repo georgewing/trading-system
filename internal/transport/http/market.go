@@ -11,7 +11,7 @@ import (
 	"time"
 
 	"trading-system/internal/hft/domain"
-	"trading-system/internal/orders"
+	"trading-system/internal/hft/infra/orders"
 	"trading-system/internal/transport/wire"
 )
 

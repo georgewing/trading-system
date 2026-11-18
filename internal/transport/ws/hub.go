@@ -4,7 +4,7 @@ import (
 	"context"
 	"sync"
 	"sync/atomic"
-	"trading-system/internal/engine"
+	"trading-system/internal/hft/engine"
 	"trading-system/internal/observability"
 )
 

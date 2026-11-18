@@ -3,7 +3,7 @@ package pipeline
 import (
 	"context"
 	"log"
-	"trading-system/internal/engine"
+	"trading-system/internal/hft/engine"
 )
 
 type ExecReportBroadcaster interface {

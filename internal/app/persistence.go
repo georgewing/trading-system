@@ -6,7 +6,7 @@ import (
 	"os"
 	"time"
 
-	"trading-system/internal/engine"
+	"trading-system/internal/hft/engine"
 	"trading-system/internal/pipeline"
 	"trading-system/internal/storage/clickhouse"
 	"trading-system/internal/storage/postgres"

@@ -4,7 +4,7 @@ import (
 	"sync"
 	"sync/atomic"
 
-	"trading-system/internal/risk"
+	"trading-system/internal/hft/risk"
 )
 
 // RiskFeed is the risk-event surface the WS server reads from.

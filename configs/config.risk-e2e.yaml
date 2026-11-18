@@ -1,0 +1,32 @@
+server:
+  api_addr: ":8091"
+  metrics_addr: ":9091"
+
+matcher:
+  symbol: "BTCUSDT"
+  price_precision: 8
+  quantity_precision: 8
+
+market:
+  enabled: false
+  provider: "binance"
+
+pipeline:
+  inbound_capacity: 1048576
+  outbound_capacity: 1048576
+
+risk:
+  enabled: true
+  symbol_whitelist: []
+  max_order_qty: 0
+  max_notional: 0
+  price_band_bps: 0
+  max_orders_per_window: 0
+  window_seconds: 0
+  max_position: 0
+
+storage:
+  postgres_dsn: ""
+
+websocket:
+  buffer_size: 1024

@@ -2,9 +2,11 @@ import { useEffect } from 'react'
 import { fetchMeta } from './api/http'
 import { TradingSocket } from './api/ws'
 import { Header } from './components/Header'
+import { AccountPanel } from './components/AccountPanel'
 import { OrderBook } from './components/OrderBook'
 import { OrderList } from './components/OrderList'
 import { OrderTicket } from './components/OrderTicket'
+import { PositionsPanel } from './components/PositionsPanel'
 import { PriceChart } from './components/PriceChart'
 import { TradeTape } from './components/TradeTape'
 import { metaStore } from './store/terminal'
@@ -59,6 +61,8 @@ export default function App() {
         </div>
         <div className="col col-right">
           <OrderTicket />
+          <AccountPanel />
+          <PositionsPanel />
           <OrderList />
         </div>
       </main>

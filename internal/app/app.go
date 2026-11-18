@@ -14,15 +14,15 @@ import (
 	"time"
 	"trading-system/pkg/idgen"
 
-	"trading-system/internal/engine"
 	"trading-system/internal/execution"
 	"trading-system/internal/hft/domain"
+	"trading-system/internal/hft/engine"
 	"trading-system/internal/hft/infra/binance"
 	"trading-system/internal/hft/infra/memstore"
+	"trading-system/internal/hft/infra/orders"
+	"trading-system/internal/hft/risk"
 	"trading-system/internal/observability"
-	"trading-system/internal/orders"
 	"trading-system/internal/pipeline"
-	"trading-system/internal/risk"
 	"trading-system/internal/routing"
 	tradinghttp "trading-system/internal/transport/http"
 	"trading-system/internal/transport/ws"
@@ -85,37 +85,57 @@ func Run(ctx context.Context, cfg *Config) error {
 		return err
 	}
 
+	persistenceEnabled := cfg.Storage.PostgresEnabled || cfg.Storage.ClickHouseEnabled
+
 	busCfg := pipeline.EventBusConfig{
 		InboundCapacity:  cfg.Pipeline.InboundCapacity,
 		OutboundCapacity: cfg.Pipeline.OutboundCapacity,
 	}
+	if persistenceEnabled {
+		busCfg.ReportEnqueueTimeout = 50 * time.Millisecond
+	}
 	bus := pipeline.NewEventBusWithConfig(matcher, busCfg)
 	bus.SetMetrics(metrics)
 	bus.SetVenueResolver(router)
+
+	extraSinks, pgWriter, err := newPersistenceSinks(ctx, cfg)
+	if err != nil {
+		_ = apiLn.Close()
+		_ = metricsLn.Close()
+		return err
+	}
+
+	// The position ledger exists even when risk checks are disabled, so the
+	// portfolio endpoints always have a consistent (empty) answer instead of
+	// disappearing from the API surface.
+	positions := risk.NewPositions()
 
 	var riskHub *ws.RiskHub
 	var riskSink *risk.AsyncSink
 	if cfg.Risk.Enabled {
 		maxOrderQty, err := scaleBy(cfg.Risk.MaxOrderQty, quantityScale)
 		if err != nil {
+			closePGWriter(pgWriter)
 			_ = apiLn.Close()
 			_ = metricsLn.Close()
 			return fmt.Errorf("risk.max_order_qty: %w", err)
 		}
 		maxPosition, err := scaleBy(cfg.Risk.MaxPosition, quantityScale)
 		if err != nil {
+			closePGWriter(pgWriter)
 			_ = apiLn.Close()
 			_ = metricsLn.Close()
 			return fmt.Errorf("risk.max_position: %w", err)
 		}
 		maxDailyLoss, err := scaleNotional(cfg.Risk.Intraday.MaxDailyLoss, priceScale, quantityScale)
 		if err != nil {
+			closePGWriter(pgWriter)
 			_ = apiLn.Close()
 			_ = metricsLn.Close()
 			return fmt.Errorf("risk.intraday.max_daily_loss: %w", err)
 		}
 
-		positions := risk.NewPositions()
+		positions = risk.NewPositions()
 		riskHub = ws.NewRiskHub(cfg.WebSocket.BufferSize, 100)
 		riskSink = risk.NewAsyncSink(risk.MultiSink{risk.NewLogSink(), riskHub}, 1024, metrics)
 
@@ -157,13 +177,6 @@ func Run(ctx context.Context, cfg *Config) error {
 			intraday.CooldownSeconds, intraday.ResumeAuto)
 	}
 
-	extraSinks, pgWriter, err := newPersistenceSinks(ctx, cfg)
-	if err != nil {
-		_ = apiLn.Close()
-		_ = metricsLn.Close()
-		return err
-	}
-
 	pipelineCtx, pipelineCancel := context.WithCancel(context.Background())
 
 	if plane.source != nil {
@@ -200,6 +213,10 @@ func Run(ctx context.Context, cfg *Config) error {
 	book := orders.NewBook(10000)
 
 	workerCfg := pipeline.DefaultOutboundWorkerConfig()
+	if persistenceEnabled {
+		workerCfg.DispatchTimeout = 50 * time.Millisecond
+		workerCfg.SinkQueueSize = 16384
+	}
 	sinks := []pipeline.ExecReportSink{
 		pipeline.NewWSSink(wsHub),
 		pipeline.NewStorageSink(book),
@@ -233,6 +250,13 @@ func Run(ctx context.Context, cfg *Config) error {
 	apiMux.Handle("/api/v1/meta", tradinghttp.MakeMetaEndpoint(
 		cfg.Matcher.Symbol, cfg.Matcher.PricePrecision, cfg.Matcher.QuantityPrecision,
 	))
+	apiMux.Handle("/api/v1/positions", tradinghttp.MakePositionsEndpoint(
+		positions, cfg.Risk.Enabled, cfg.Matcher.PricePrecision, cfg.Matcher.QuantityPrecision,
+	))
+	apiMux.Handle("/api/v1/account", tradinghttp.MakeAccountEndpoint(
+		positions, cfg.Risk.Enabled, cfg.Matcher.PricePrecision, cfg.Matcher.QuantityPrecision,
+	))
+	apiMux.Handle("/api/v1/order/cancel", tradinghttp.MakeCancelEndpoint(bus))
 
 	snapshotter := plane.snapshotter()
 	apiMux.Handle("/api/v1/market/depth", tradinghttp.MakeDepthEndpoint(
@@ -291,7 +315,6 @@ func Run(ctx context.Context, cfg *Config) error {
 		}
 	}
 
-	log.Printf("pipeline stopped: tracked orders=%d", book.Len())
 	if riskSink != nil {
 		closeCtx, closeCancel := context.WithTimeout(context.Background(), 2*time.Second)
 		if err := riskSink.Close(closeCtx); err != nil {

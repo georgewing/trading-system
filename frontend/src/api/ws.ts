@@ -11,6 +11,7 @@ import type {
 } from './envelope'
 import {
   connectionStore,
+  execTickStore,
   mergeKlines,
   metaStore,
   prependTrades,
@@ -248,7 +249,8 @@ export class TradingSocket {
     if (batch.tradeAppend.length > 0) prependTrades(batch.tradeAppend)
     if (batch.klines) replaceKlines(batch.klines)
     if (batch.klineAppend.length > 0) mergeKlines(batch.klineAppend)
-    for (const report of batch.orders) upsertExecReport(report)
+  	  for (const report of batch.orders) upsertExecReport(report)
+  	  if (batch.orders.length > 0) execTickStore.set((n) => n + 1)
 
     if (batch.gaps > 0 || batch.lastSeq !== 0) {
       connectionStore.set((prev) => ({

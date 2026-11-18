@@ -177,7 +177,9 @@ select {
 }
 
 .col-right {
-  grid-template-rows: auto minmax(0, 1fr);
+  grid-auto-rows: max-content;
+  align-content: start;
+  overflow-y: auto;
 }
 
 .panel {
@@ -364,8 +366,17 @@ select {
   overflow-y: auto;
 }
 
+/* Fixed row height drives the virtual window math in TradeTape.tsx
+   (ROW_HEIGHT = 20). Keep the two in sync. */
 .tape-row {
   grid-template-columns: 1fr 1fr auto;
+  height: 20px;
+}
+
+/* Virtual scrolling spacers: the real heights are written inline so the
+   scrollbar length always matches the full tape. */
+.tape-spacer {
+  height: 0;
 }
 
 .time {
@@ -519,7 +530,7 @@ select {
 
 .orders-labels,
 .orders-row {
-  grid-template-columns: 62px 42px 1fr 1fr 46px 96px;
+  grid-template-columns: 62px 42px 1fr 1fr 46px 88px 54px;
 }
 
 .orders-body {
@@ -562,6 +573,114 @@ select {
 .orders-reason {
   padding: 6px 12px;
   border-top: 1px solid var(--border);
+  text-align: left;
+}
+
+.panel-orders {
+  min-height: 220px;
+  max-height: 340px;
+}
+
+.panel-positions {
+  min-height: 150px;
+}
+
+.row-action {
+  display: flex;
+  justify-content: flex-end;
+  position: relative;
+  z-index: 1;
+}
+
+.cancel-btn {
+  padding: 2px 6px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: transparent;
+  color: var(--muted);
+  font-size: 10px;
+  cursor: pointer;
+}
+
+.cancel-btn:hover:not(:disabled) {
+  border-color: var(--down);
+  color: var(--down);
+}
+
+.cancel-btn:disabled {
+  opacity: 0.5;
+  cursor: progress;
+}
+
+/* ---------- positions ---------- */
+
+.positions {
+  display: flex;
+  flex-direction: column;
+  font-family: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, monospace;
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+
+.positions-labels,
+.positions-row {
+  display: grid;
+  grid-template-columns: 1fr 0.8fr 1fr 1fr 1fr;
+  gap: 6px;
+  padding: 3px 12px;
+  text-align: right;
+}
+
+.positions-labels {
+  color: var(--muted);
+  font-size: 10px;
+  letter-spacing: 0.5px;
+  text-transform: uppercase;
+}
+
+.positions-labels span:first-child,
+.positions-row span:first-child {
+  text-align: left;
+}
+
+.positions-row:hover {
+  background: #161b22;
+}
+
+.pnl-up {
+  color: var(--up);
+}
+
+.pnl-down {
+  color: var(--down);
+}
+
+/* ---------- account ---------- */
+
+.account {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 10px 12px;
+}
+
+.account-row {
+  display: flex;
+  justify-content: space-between;
+  font-size: 11px;
+}
+
+.account-row span:first-child {
+  color: var(--muted);
+}
+
+.account-value {
+  font-family: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, monospace;
+  font-variant-numeric: tabular-nums;
+}
+
+.account-note {
+  margin: 4px 0 0;
   text-align: left;
 }
 

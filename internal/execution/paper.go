@@ -5,7 +5,7 @@ import (
 	"errors"
 	"fmt"
 
-	"trading-system/internal/engine"
+	"trading-system/internal/hft/engine"
 )
 
 // DefaultPaperVenueName is used when NewPaperVenue receives an empty name.

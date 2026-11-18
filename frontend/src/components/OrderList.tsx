@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { fetchOrders } from '../api/http'
+import { cancelOrder, fetchOrders } from '../api/http'
 import type { OrderStatus } from '../api/envelope'
 import { formatClock, formatQty, scaledToDecimal, ticksToPrice } from '../lib/format'
 import { useStore } from '../store/createStore'
@@ -18,6 +18,7 @@ export function OrderList() {
   const orders = useStore(ordersStore)
   const meta = useStore(metaStore)
   const [error, setError] = useState<string | null>(null)
+  const [canceling, setCanceling] = useState<string | null>(null)
 
   useEffect(() => {
     let cancelled = false
@@ -37,6 +38,18 @@ export function OrderList() {
     }
   }, [])
 
+  async function handleCancel(orderId: string) {
+    setCanceling(orderId)
+    setError(null)
+    try {
+      await cancelOrder(orderId)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'cancel failed')
+    } finally {
+      setCanceling(null)
+    }
+  }
+
   return (
     <section className="panel panel-orders">
       <div className="panel-head">
@@ -54,6 +67,7 @@ export function OrderList() {
           <span>Qty</span>
           <span>Filled</span>
           <span>Status</span>
+          <span />
         </div>
 
         <div className="orders-body">
@@ -78,6 +92,19 @@ export function OrderList() {
             			  <span className="qty">{scaledToDecimal(order.filled, meta.quantityPrecision)}</span>
               <span className={`status ${STATUS_CLASS[order.status]}`}>
                 {order.status}
+              </span>
+              <span className="row-action">
+                {(order.status === 'NEW' ||
+                  order.status === 'PARTIALLY_FILLED') && (
+                  <button
+                    type="button"
+                    className="cancel-btn"
+                    disabled={canceling === order.order_id}
+                    onClick={() => handleCancel(order.order_id)}
+                  >
+                    {canceling === order.order_id ? '…' : 'Cancel'}
+                  </button>
+                )}
               </span>
             </div>
           ))}

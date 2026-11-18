@@ -7,8 +7,8 @@ import (
 	"testing"
 	"time"
 
-	"trading-system/internal/engine"
-	"trading-system/internal/risk"
+	"trading-system/internal/hft/engine"
+	"trading-system/internal/hft/risk"
 )
 
 // fakeRiskGuard records the requests it evaluates and returns a fixed decision.

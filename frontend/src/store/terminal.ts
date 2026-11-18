@@ -50,6 +50,13 @@ export const tradesStore = createStore<TradeData[]>([])
 export const klinesStore = createStore<KlineData[]>([])
 export const ordersStore = createStore<OrderRow[]>([])
 
+/**
+ * execTick increments once per flush that contained execution reports.
+ * Portfolio panels depend on it, so they refresh exactly when a fill or a
+ * cancel could have moved their numbers, instead of polling.
+ */
+export const execTickStore = createStore<number>(0)
+
 export function setDepth(depth: DepthData): void {
   depthStore.set(depth)
 }

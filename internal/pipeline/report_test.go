@@ -4,7 +4,7 @@ import (
 	"errors"
 	"testing"
 
-	"trading-system/internal/engine"
+	"trading-system/internal/hft/engine"
 )
 
 func TestBuildExecReportsFillsV2Fields(t *testing.T) {

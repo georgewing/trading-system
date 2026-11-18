@@ -6,7 +6,7 @@ import (
 	"sync"
 	"testing"
 
-	"trading-system/internal/engine"
+	"trading-system/internal/hft/engine"
 	"trading-system/internal/execution"
 )
 

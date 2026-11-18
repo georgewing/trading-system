@@ -5,7 +5,7 @@
 #   quantity = integer lots  (matcher.quantity_precision)
 #   cash, pnl, fees = ticks * lots
 #
-# The data file is one JSON object per line, see internal/backtest/source.go.
+# The data file is one JSON object per line, see internal/hft/backtest/source.go.
 backtest:
   initial_cash: 1000000000000 # 10000.0 * 1e8 in ticks*lots units
   maker_fee_bps: 2
@@ -24,7 +24,7 @@ backtest:
   max_panics: 3
 
 data:
-  path: ./internal/backtest/testdata/sample.jsonl
+  path: ./internal/hft/backtest/testdata/sample.jsonl
 
 strategy:
   name: market_maker         # noop | market_maker | stat_arb

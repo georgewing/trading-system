@@ -4,14 +4,15 @@ import (
 	"sync"
 	"testing"
 
-	"trading-system/internal/engine"
-	"trading-system/internal/risk"
+	"trading-system/internal/hft/engine"
+	"trading-system/internal/hft/risk"
 )
 
 type fakeRiskObserver struct {
 	mu       sync.Mutex
 	accepted []engine.Order
 	reports  []engine.ExecReport
+	canceled []engine.Order
 }
 
 func (o *fakeRiskObserver) OnOrderAccepted(order engine.Order) {
@@ -23,6 +24,12 @@ func (o *fakeRiskObserver) OnOrderAccepted(order engine.Order) {
 func (o *fakeRiskObserver) OnExecReport(order engine.Order, report engine.ExecReport) {
 	o.mu.Lock()
 	o.reports = append(o.reports, report)
+	o.mu.Unlock()
+}
+
+func (o *fakeRiskObserver) OnCancel(order engine.Order) {
+	o.mu.Lock()
+	o.canceled = append(o.canceled, order)
 	o.mu.Unlock()
 }
 

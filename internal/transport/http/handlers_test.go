@@ -9,9 +9,9 @@ import (
 	"testing"
 	"time"
 
-	"trading-system/internal/engine"
+	"trading-system/internal/hft/engine"
+	"trading-system/internal/hft/risk"
 	"trading-system/internal/pipeline"
-	"trading-system/internal/risk"
 	"trading-system/pkg/idgen"
 )
 

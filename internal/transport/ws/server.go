@@ -23,11 +23,11 @@ import (
 
 	"github.com/coder/websocket"
 
-	"trading-system/internal/engine"
+	"trading-system/internal/hft/engine"
 	"trading-system/internal/hft/domain"
+	"trading-system/internal/hft/risk"
 	"trading-system/internal/observability"
-	"trading-system/internal/orders"
-	"trading-system/internal/risk"
+	"trading-system/internal/hft/infra/orders"
 	"trading-system/internal/transport/wire"
 )
 

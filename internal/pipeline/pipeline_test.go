@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"trading-system/internal/engine"
+	"trading-system/internal/hft/engine"
 	"trading-system/pkg/ringbuffer"
 )
 

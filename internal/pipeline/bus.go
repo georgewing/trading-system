@@ -7,7 +7,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
-	"trading-system/internal/engine"
+	"trading-system/internal/hft/engine"
 	"trading-system/internal/observability"
 	"trading-system/pkg/ringbuffer"
 )
@@ -58,6 +58,7 @@ type EventBus struct {
 
 	cfg      EventBusConfig
 	submitMu sync.Mutex // ringbuffer 是 SPSC；多 producer 时必须保护 enqueue
+	reportMu sync.Mutex // serializes outbound enqueue from the bus and external venues
 
 	// riskGuard 为可选的事前风控阶段，nil 表示关闭；只在处理 goroutine 读取。
 	riskGuard         RiskGuard
@@ -253,10 +254,9 @@ func (b *EventBus) processCommand(ctx context.Context, cmd OrderCommand) {
 			return
 		}
 
-		// Notify only after routing succeeds: a routing rejection never reaches
-		// the venue and must not leave an open-order slot behind.
-		b.notifyAccepted(cmd.Order)
-
+		if b.riskObserver != nil {
+			b.riskObserver.OnOrderAccepted(cmd.Order)
+		}
 		submitStart := time.Now()
 		result, submitErr := venue.Submit(ctx, cmd.Order)
 		b.observeSubmitLatency(submitStart, submitErr)
@@ -264,8 +264,9 @@ func (b *EventBus) processCommand(ctx context.Context, cmd OrderCommand) {
 		return
 	}
 
-	b.notifyAccepted(cmd.Order)
-
+	if b.riskObserver != nil {
+		b.riskObserver.OnOrderAccepted(cmd.Order)
+	}
 	submitStart := time.Now()
 	result, matchErr := b.matcher.SubmitOrderDetailed(ctx, cmd.Order)
 	b.observeSubmitLatency(submitStart, matchErr)
@@ -309,6 +310,84 @@ func (b *EventBus) publishResult(ctx context.Context, cmd OrderCommand, result e
 	}
 }
 
+// PublishReport injects an execution report produced outside the matching
+// goroutine, for example by an external venue's user-data stream. It updates
+// risk state and enqueues the report to the same outbound sinks as paper fills.
+func (b *EventBus) PublishReport(ctx context.Context, report engine.ExecReport) error {
+	if report.Timestamp == 0 {
+		report.Timestamp = time.Now().UnixNano()
+	}
+	if report.ExecID == 0 {
+		report.ExecID = nextExecID()
+	}
+
+	order := engine.Order{
+		ID:            report.OrderID,
+		ClientOrderID: report.ClientOrderID,
+		AccountID:     report.AccountID,
+		Symbol:        report.Symbol,
+		Side:          report.Side,
+		Type:          report.OrderType,
+		TIF:           report.TIF,
+		Price:         report.OrderPx,
+		Quantity:      report.Quantity,
+	}
+	if b.riskObserver != nil {
+		b.riskObserver.OnExecReport(order, report)
+	}
+	return b.enqueueReport(ctx, report)
+}
+
+// CancelOrder cancels a resting order and publishes a CANCELED execution report
+// through the same path as fills, so the order read model and the risk state
+// stay consistent.
+//
+// The matcher mutex makes this safe to call from an HTTP handler while the
+// pipeline is matching.
+func (b *EventBus) CancelOrder(ctx context.Context, orderID uint64, reason string) (engine.ExecReport, error) {
+	if !b.accepting.Load() {
+		return engine.ExecReport{}, ErrShuttingDown
+	}
+	if b.matcher == nil {
+		return engine.ExecReport{}, errors.New("pipeline: no matcher configured")
+	}
+
+	canceled, err := b.matcher.Cancel(ctx, orderID)
+	if err != nil {
+		return engine.ExecReport{}, err
+	}
+
+	// Cancel-ratio accounting: the monitor counts cancels separately from fills.
+	if b.riskObserver != nil {
+		b.riskObserver.OnCancel(canceled)
+	}
+
+	if reason == "" {
+		reason = "canceled by user"
+	}
+	report := engine.ExecReport{
+		OrderID:       canceled.ID,
+		ClientOrderID: canceled.ClientOrderID,
+		AccountID:     canceled.AccountID,
+		Symbol:        canceled.Symbol,
+		Side:          canceled.Side,
+		OrderType:     canceled.Type,
+		TIF:           canceled.TIF,
+		OrderPx:       canceled.Price,
+		Quantity:      canceled.Quantity,
+		Status:        engine.OrderStatusCanceled,
+		Filled:        canceled.Filled,
+		Leaves:        0,
+		Reason:        reason,
+		Timestamp:     time.Now().UnixNano(),
+	}
+
+	if err := b.PublishReport(ctx, report); err != nil {
+		return report, err
+	}
+	return report, nil
+}
+
 func (b *EventBus) sendResult(ctx context.Context, ch chan<- MatchResult, r MatchResult) {
 	if ch == nil {
 		return
@@ -333,7 +412,10 @@ func (b *EventBus) enqueueReport(ctx context.Context, report engine.ExecReport) 
 	defer stopTimer(timer)
 
 	for {
-		if b.outbound.Enqueue(report) {
+		b.reportMu.Lock()
+		ok := b.outbound.Enqueue(report)
+		b.reportMu.Unlock()
+		if ok {
 			b.metrics.SetQueueBacklog("outbound", float64(b.outbound.Len()))
 			return nil
 		}

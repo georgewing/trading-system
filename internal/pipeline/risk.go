@@ -7,8 +7,8 @@ import (
 	"math"
 	"math/bits"
 
-	"trading-system/internal/engine"
-	"trading-system/internal/risk"
+	"trading-system/internal/hft/engine"
+	"trading-system/internal/hft/risk"
 )
 
 // RiskGuard is the narrow pre-trade risk interface consumed by EventBus. It is
@@ -23,6 +23,9 @@ type RiskGuard interface {
 type RiskObserver interface {
 	OnOrderAccepted(order engine.Order)
 	OnExecReport(order engine.Order, report engine.ExecReport)
+	// OnCancel reports a cancellation that happened outside the fill path, so
+	// cancel-ratio accounting sees it.
+	OnCancel(order engine.Order)
 }
 
 // Results reported to observability.Recorder.IncRiskDecision.

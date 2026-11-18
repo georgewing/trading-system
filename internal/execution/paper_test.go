@@ -6,7 +6,7 @@ import (
 	"reflect"
 	"testing"
 
-	"trading-system/internal/engine"
+	"trading-system/internal/hft/engine"
 )
 
 type fakeMatcher struct {

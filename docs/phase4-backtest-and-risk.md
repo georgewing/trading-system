@@ -9,15 +9,15 @@ configuration surface, and the operational follow-ups.
 Delivered:
 
 - strategy contract shared by backtest and live execution
-  (`internal/strategy`);
+  (`internal/hft/strategy`);
 - deterministic historical replay and simulated execution
-  (`internal/backtest`);
+  (`internal/hft/backtest`);
 - fee, slippage and fill-probability models;
 - market-making and statistical-arbitrage sample strategies;
 - performance reporting (equity, drawdown, Sharpe, fill rate, win rate,
   turnover, exposure);
 - intraday risk monitoring with strategy breakers and a position ledger
-  (`internal/risk`);
+  (`internal/hft/risk`);
 - risk event publishing to logs, Prometheus and the WebSocket terminal;
 - `risk_events` Postgres migration.
 
@@ -66,7 +66,7 @@ One JSON object per line, monotonically non-decreasing `ts`:
 {"ts":1700000030000,"symbol":"BTCUSDT","kind":"trade","trade":{"id":1,"price":9997,"qty":100000000}}
 ```
 
-A sample file lives at `internal/backtest/testdata/sample.jsonl`.
+A sample file lives at `internal/hft/backtest/testdata/sample.jsonl`.
 
 ### Simulation model
 
@@ -106,7 +106,7 @@ order-id creation order, so map iteration order cannot change results.
 
 ### Strategy contract
 
-`internal/strategy.Strategy` receives:
+`internal/hft/strategy.Strategy` receives:
 
 - `OnBook(BookView)`: a depth snapshot;
 - `OnTrade(TradeView)`: a public print;
@@ -218,7 +218,7 @@ decision.
 ## Tests
 
 ```sh
-GOCACHE=/tmp/go-build go test ./internal/backtest ./internal/strategy ./internal/risk ./internal/pipeline ./internal/app
+GOCACHE=/tmp/go-build go test ./internal/hft/backtest ./internal/hft/strategy ./internal/hft/risk ./internal/pipeline ./internal/app
 GOCACHE=/tmp/go-build go test ./...
 ```
 

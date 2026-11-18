@@ -57,3 +57,17 @@ type Order struct {
 	CreatedAt     time.Time
 	UpdatedAt     time.Time
 }
+
+// Position is the persisted form of one account's position in one symbol. Qty
+// is signed; AvgCost, Mark and Realized use the same tick and notional units as
+// the in-memory risk ledger. UpdatedAt should be set by the caller that takes
+// the snapshot so a restart does not rewrite the timestamp of unchanged rows.
+type Position struct {
+	AccountID uint64
+	Symbol    string
+	Qty       int64
+	AvgCost   int64
+	Mark      int64
+	Realized  int64
+	UpdatedAt time.Time
+}

@@ -6,7 +6,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
-	"trading-system/internal/engine"
+	"trading-system/internal/hft/engine"
 	"trading-system/internal/observability"
 	"trading-system/pkg/ringbuffer"
 )

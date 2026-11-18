@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"database/sql/driver"
 	"errors"
+	"io"
 	"reflect"
 	"strings"
 	"sync"
@@ -13,8 +14,9 @@ import (
 )
 
 var (
-	_ DB = (*sql.DB)(nil)
-	_ DB = (*fakeDB)(nil)
+	_ DB   = (*sql.DB)(nil)
+	_ DB   = (*fakeDB)(nil)
+	_ Rows = (*sql.Rows)(nil)
 )
 
 type execCall struct {
@@ -22,12 +24,17 @@ type execCall struct {
 	args  []any
 }
 
-// fakeDB records ExecContext calls and returns configurable errors. It never
-// talks to a real database.
+// fakeDB records ExecContext and QueryContext calls and returns configurable
+// errors. It never talks to a real database.
 type fakeDB struct {
 	mu sync.Mutex
 
-	calls []execCall
+	calls      []execCall
+	queryCalls []execCall
+
+	queryRows [][]driver.Value
+	queryErr  error
+	queryDB   *sql.DB
 
 	execErr    error
 	pingErr    error
@@ -55,9 +62,37 @@ func (f *fakeDB) ExecContext(ctx context.Context, query string, args ...any) (sq
 }
 
 // QueryRowContext is part of the narrow DB interface but Writer does not issue
-// read queries yet, so the fake returns nil.
+// single-row read queries yet, so the fake returns nil.
 func (f *fakeDB) QueryRowContext(context.Context, string, ...any) *sql.Row {
 	return nil
+}
+
+// QueryContext serves the configured rows through a real *sql.Rows built on an
+// in-memory driver, so LoadPositions is exercised end to end.
+func (f *fakeDB) QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
+	f.mu.Lock()
+	f.queryCalls = append(f.queryCalls, execCall{
+		query: query,
+		args:  append([]any(nil), args...),
+	})
+	queryErr := f.queryErr
+	if f.queryDB == nil {
+		f.queryDB = sql.OpenDB(staticConnector{driver: &staticDriver{
+			columns: positionColumns,
+			rows:    f.queryRows,
+		}})
+	}
+	db := f.queryDB
+	f.mu.Unlock()
+
+	if queryErr != nil {
+		return nil, queryErr
+	}
+	return db.QueryContext(ctx, query, args...)
 }
 
 func (f *fakeDB) PingContext(ctx context.Context) error {
@@ -74,10 +109,16 @@ func (f *fakeDB) PingContext(ctx context.Context) error {
 
 func (f *fakeDB) Close() error {
 	f.mu.Lock()
-	defer f.mu.Unlock()
-
+	db := f.queryDB
+	f.queryDB = nil
 	f.closeCalls++
-	return f.closeErr
+	err := f.closeErr
+	f.mu.Unlock()
+
+	if db != nil {
+		_ = db.Close()
+	}
+	return err
 }
 
 func (f *fakeDB) execCalls() []execCall {
@@ -86,6 +127,15 @@ func (f *fakeDB) execCalls() []execCall {
 
 	out := make([]execCall, len(f.calls))
 	copy(out, f.calls)
+	return out
+}
+
+func (f *fakeDB) queries() []execCall {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	out := make([]execCall, len(f.queryCalls))
+	copy(out, f.queryCalls)
 	return out
 }
 
@@ -122,6 +172,9 @@ func TestNilWriter(t *testing.T) {
 		{"UpsertOrder", func() error { return w.UpsertOrder(ctx, Order{}) }},
 		{"InsertTrade", func() error { return w.InsertTrade(ctx, Trade{}) }},
 		{"InsertExecEvent", func() error { return w.InsertExecEvent(ctx, ExecEvent{}) }},
+		{"UpsertPosition", func() error { return w.UpsertPosition(ctx, Position{}) }},
+		{"UpsertPositions", func() error { return w.UpsertPositions(ctx, nil) }},
+		{"LoadPositions", func() error { _, err := w.LoadPositions(ctx); return err }},
 	}
 
 	for _, check := range checks {
@@ -143,6 +196,9 @@ func TestNilDB(t *testing.T) {
 		{"UpsertOrder", func() error { return w.UpsertOrder(ctx, Order{}) }},
 		{"InsertTrade", func() error { return w.InsertTrade(ctx, Trade{}) }},
 		{"InsertExecEvent", func() error { return w.InsertExecEvent(ctx, ExecEvent{}) }},
+		{"UpsertPosition", func() error { return w.UpsertPosition(ctx, Position{}) }},
+		{"UpsertPositions", func() error { return w.UpsertPositions(ctx, nil) }},
+		{"LoadPositions", func() error { _, err := w.LoadPositions(ctx); return err }},
 		{"Close", func() error { return w.Close() }},
 	}
 
@@ -178,6 +234,9 @@ func TestClosedWriter(t *testing.T) {
 		{"UpsertOrder", func() error { return w.UpsertOrder(ctx, Order{}) }},
 		{"InsertTrade", func() error { return w.InsertTrade(ctx, Trade{}) }},
 		{"InsertExecEvent", func() error { return w.InsertExecEvent(ctx, ExecEvent{}) }},
+		{"UpsertPosition", func() error { return w.UpsertPosition(ctx, Position{}) }},
+		{"UpsertPositions", func() error { return w.UpsertPositions(ctx, nil) }},
+		{"LoadPositions", func() error { _, err := w.LoadPositions(ctx); return err }},
 	}
 
 	for _, check := range checks {
@@ -467,6 +526,10 @@ func TestExecErrorPropagation(t *testing.T) {
 		{"UpsertOrder", func(w *Writer) error { return w.UpsertOrder(ctx, Order{}) }},
 		{"InsertTrade", func(w *Writer) error { return w.InsertTrade(ctx, Trade{}) }},
 		{"InsertExecEvent", func(w *Writer) error { return w.InsertExecEvent(ctx, ExecEvent{}) }},
+		{"UpsertPosition", func(w *Writer) error { return w.UpsertPosition(ctx, Position{}) }},
+		{"UpsertPositions", func(w *Writer) error {
+			return w.UpsertPositions(ctx, []Position{{AccountID: 42, Symbol: "BTC-USDT"}})
+		}},
 	}
 
 	for _, check := range checks {
@@ -496,6 +559,15 @@ func TestContextCanceled(t *testing.T) {
 	}
 	if err := w.InsertExecEvent(ctx, ExecEvent{}); !errors.Is(err, context.Canceled) {
 		t.Errorf("InsertExecEvent() error = %v, want context.Canceled", err)
+	}
+	if err := w.UpsertPosition(ctx, Position{}); !errors.Is(err, context.Canceled) {
+		t.Errorf("UpsertPosition() error = %v, want context.Canceled", err)
+	}
+	if err := w.UpsertPositions(ctx, []Position{{AccountID: 42, Symbol: "BTC-USDT"}}); !errors.Is(err, context.Canceled) {
+		t.Errorf("UpsertPositions() error = %v, want context.Canceled", err)
+	}
+	if _, err := w.LoadPositions(ctx); !errors.Is(err, context.Canceled) {
+		t.Errorf("LoadPositions() error = %v, want context.Canceled", err)
 	}
 }
 
@@ -539,6 +611,255 @@ func TestConcurrentInserts(t *testing.T) {
 	if got, want := len(db.execCalls()), goroutines*perGoroutine; got != want {
 		t.Fatalf("exec calls = %d, want %d", got, want)
 	}
+}
+
+func TestUpsertPosition(t *testing.T) {
+	db := &fakeDB{}
+	w := NewWriter(db)
+
+	updatedAt := time.Date(2026, 11, 19, 11, 0, 0, 0, time.UTC)
+	position := Position{
+		AccountID: 42,
+		Symbol:    "BTC-USDT",
+		Qty:       -3,
+		AvgCost:   1234500,
+		Mark:      1235000,
+		Realized:  -1200,
+		UpdatedAt: updatedAt,
+	}
+
+	if err := w.UpsertPosition(context.Background(), position); err != nil {
+		t.Fatalf("UpsertPosition() error = %v", err)
+	}
+
+	call := singleCall(t, db)
+	requireContains(t, call.query,
+		"INSERT INTO positions",
+		"account_id",
+		"symbol",
+		"qty",
+		"avg_cost",
+		"mark",
+		"realized",
+		"updated_at",
+		"$7",
+		"ON CONFLICT (account_id, symbol) DO UPDATE",
+	)
+	requireNotContains(t, call.query, "BTC-USDT", "1234500", "42")
+
+	assertArgs(t, call.args, []any{
+		uint64(42),
+		"BTC-USDT",
+		int64(-3),
+		int64(1234500),
+		int64(1235000),
+		int64(-1200),
+		updatedAt,
+	})
+}
+
+func TestUpsertPositions(t *testing.T) {
+	db := &fakeDB{}
+	w := NewWriter(db)
+
+	updatedAt := time.Date(2026, 11, 19, 11, 5, 0, 0, time.UTC)
+	batch := []Position{
+		{AccountID: 42, Symbol: "BTC-USDT", Qty: 10, AvgCost: 100, Mark: 101, Realized: 5, UpdatedAt: updatedAt},
+		{AccountID: 43, Symbol: "ETH-USDT", Qty: -2, AvgCost: 200, Mark: 198, Realized: -4, UpdatedAt: updatedAt.Add(time.Second)},
+	}
+
+	if err := w.UpsertPositions(context.Background(), batch); err != nil {
+		t.Fatalf("UpsertPositions() error = %v", err)
+	}
+
+	calls := db.execCalls()
+	if len(calls) != len(batch) {
+		t.Fatalf("exec calls = %d, want %d", len(calls), len(batch))
+	}
+	for i, call := range calls {
+		requireContains(t, call.query, "INSERT INTO positions", "ON CONFLICT (account_id, symbol) DO UPDATE")
+		assertArgs(t, call.args, []any{
+			batch[i].AccountID,
+			batch[i].Symbol,
+			batch[i].Qty,
+			batch[i].AvgCost,
+			batch[i].Mark,
+			batch[i].Realized,
+			batch[i].UpdatedAt,
+		})
+	}
+}
+
+func TestUpsertPositionsEmpty(t *testing.T) {
+	db := &fakeDB{}
+	w := NewWriter(db)
+
+	if err := w.UpsertPositions(context.Background(), nil); err != nil {
+		t.Fatalf("UpsertPositions(nil) error = %v", err)
+	}
+	if got := len(db.execCalls()); got != 0 {
+		t.Fatalf("exec calls = %d, want 0", got)
+	}
+}
+
+func TestUpsertPositionsReportsFailingEntry(t *testing.T) {
+	sentinel := errors.New("write failed")
+	w := NewWriter(&fakeDB{execErr: sentinel})
+
+	err := w.UpsertPositions(context.Background(), []Position{{AccountID: 42, Symbol: "BTC-USDT"}})
+	if !errors.Is(err, sentinel) {
+		t.Fatalf("UpsertPositions() error = %v, want wrapped %v", err, sentinel)
+	}
+	if !strings.Contains(err.Error(), "positions[0]") || !strings.Contains(err.Error(), "BTC-USDT") {
+		t.Fatalf("UpsertPositions() error = %q, want failing index and key", err)
+	}
+}
+
+func TestLoadPositions(t *testing.T) {
+	updatedAt := time.Date(2026, 11, 19, 11, 10, 0, 0, time.UTC)
+	db := &fakeDB{queryRows: [][]driver.Value{
+		{int64(42), "BTC-USDT", int64(10), int64(100), int64(101), int64(5), updatedAt},
+		{int64(43), "ETH-USDT", int64(-2), int64(200), int64(198), int64(-4), updatedAt.Add(time.Second)},
+	}}
+	w := NewWriter(db)
+
+	got, err := w.LoadPositions(context.Background())
+	if err != nil {
+		t.Fatalf("LoadPositions() error = %v", err)
+	}
+
+	want := []Position{
+		{AccountID: 42, Symbol: "BTC-USDT", Qty: 10, AvgCost: 100, Mark: 101, Realized: 5, UpdatedAt: updatedAt},
+		{AccountID: 43, Symbol: "ETH-USDT", Qty: -2, AvgCost: 200, Mark: 198, Realized: -4, UpdatedAt: updatedAt.Add(time.Second)},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("LoadPositions() = %+v, want %+v", got, want)
+	}
+
+	queries := db.queries()
+	if len(queries) != 1 {
+		t.Fatalf("query calls = %d, want 1", len(queries))
+	}
+	requireContains(t, queries[0].query,
+		"FROM positions",
+		"account_id",
+		"symbol",
+		"qty",
+		"avg_cost",
+		"mark",
+		"realized",
+		"updated_at",
+		"ORDER BY account_id, symbol",
+	)
+}
+
+func TestLoadPositionsEmpty(t *testing.T) {
+	w := NewWriter(&fakeDB{})
+
+	got, err := w.LoadPositions(context.Background())
+	if err != nil {
+		t.Fatalf("LoadPositions() error = %v", err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("LoadPositions() = %+v, want empty", got)
+	}
+}
+
+func TestLoadPositionsQueryError(t *testing.T) {
+	sentinel := errors.New("query failed")
+	w := NewWriter(&fakeDB{queryErr: sentinel})
+
+	if _, err := w.LoadPositions(context.Background()); !errors.Is(err, sentinel) {
+		t.Fatalf("LoadPositions() error = %v, want wrapped %v", err, sentinel)
+	}
+}
+
+func TestScanPositionsErrors(t *testing.T) {
+	scanErr := errors.New("scan failed")
+	if _, err := scanPositions(&fakeRows{remaining: 1, scanErr: scanErr}); !errors.Is(err, scanErr) {
+		t.Fatalf("scanPositions() scan error = %v, want wrapped %v", err, scanErr)
+	}
+
+	iterErr := errors.New("iteration failed")
+	if _, err := scanPositions(&fakeRows{remaining: 1, iterErr: iterErr}); !errors.Is(err, iterErr) {
+		t.Fatalf("scanPositions() iteration error = %v, want wrapped %v", err, iterErr)
+	}
+}
+
+// fakeRows implements the narrow Rows interface for scan and iteration errors.
+// It does not assign destination values; value mapping is covered by
+// TestLoadPositions through a real *sql.Rows.
+type fakeRows struct {
+	remaining int
+	scanErr   error
+	iterErr   error
+}
+
+func (r *fakeRows) Next() bool {
+	if r.remaining <= 0 {
+		return false
+	}
+	r.remaining--
+	return true
+}
+
+func (r *fakeRows) Scan(...any) error { return r.scanErr }
+func (r *fakeRows) Err() error        { return r.iterErr }
+func (r *fakeRows) Close() error      { return nil }
+
+var positionColumns = []string{"account_id", "symbol", "qty", "avg_cost", "mark", "realized", "updated_at"}
+
+// staticDriver serves a fixed result set through database/sql. It is the only
+// way to produce a real *sql.Rows without a database or a mock dependency.
+type staticDriver struct {
+	columns []string
+	rows    [][]driver.Value
+}
+
+func (d *staticDriver) Open(string) (driver.Conn, error) {
+	return &staticConn{driver: d}, nil
+}
+
+type staticConnector struct{ driver *staticDriver }
+
+func (c staticConnector) Connect(context.Context) (driver.Conn, error) {
+	return &staticConn{driver: c.driver}, nil
+}
+
+func (c staticConnector) Driver() driver.Driver { return c.driver }
+
+type staticConn struct{ driver *staticDriver }
+
+func (c *staticConn) Prepare(string) (driver.Stmt, error) {
+	return nil, errors.New("static driver: Prepare unsupported")
+}
+
+func (c *staticConn) Close() error { return nil }
+
+func (c *staticConn) Begin() (driver.Tx, error) {
+	return nil, errors.New("static driver: Begin unsupported")
+}
+
+func (c *staticConn) QueryContext(context.Context, string, []driver.NamedValue) (driver.Rows, error) {
+	return &staticRows{columns: c.driver.columns, rows: c.driver.rows}, nil
+}
+
+type staticRows struct {
+	columns []string
+	rows    [][]driver.Value
+	next    int
+}
+
+func (r *staticRows) Columns() []string { return r.columns }
+func (r *staticRows) Close() error      { return nil }
+
+func (r *staticRows) Next(dest []driver.Value) error {
+	if r.next >= len(r.rows) {
+		return io.EOF
+	}
+	copy(dest, r.rows[r.next])
+	r.next++
+	return nil
 }
 
 func singleCall(t *testing.T, db *fakeDB) execCall {

@@ -32,14 +32,25 @@ var (
 // and callers to substitute their own implementation.
 type DB interface {
 	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
+	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
 	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
 	PingContext(ctx context.Context) error
 	Close() error
 }
 
-// Writer persists execution events and trades. Its methods are safe for
-// concurrent use. Writer does not retry failed statements: the outbound worker
-// owns retry policy, and every method honors the caller's context.
+// Rows is the subset of *sql.Rows that LoadPositions drains. The narrow
+// interface lets tests cover scanning without a database.
+type Rows interface {
+	Next() bool
+	Scan(dest ...any) error
+	Err() error
+	Close() error
+}
+
+// Writer persists orders, execution events, trades and position snapshots. Its
+// methods are safe for concurrent use. Writer does not retry failed statements:
+// the outbound worker owns retry policy, and every method honors the caller's
+// context.
 type Writer struct {
 	db DB
 
@@ -186,6 +197,89 @@ func (w *Writer) InsertExecEvent(ctx context.Context, e ExecEvent) error {
 	return nil
 }
 
+// UpsertPosition inserts one position or overwrites the mutable columns when
+// (account_id, symbol) already exists.
+func (w *Writer) UpsertPosition(ctx context.Context, p Position) error {
+	if err := w.ready(); err != nil {
+		return err
+	}
+	if err := w.upsertPosition(ctx, p); err != nil {
+		return fmt.Errorf("postgres: upsert position account=%d symbol=%q: %w", p.AccountID, p.Symbol, err)
+	}
+	return nil
+}
+
+// UpsertPositions writes a batch of positions. The DB interface has no
+// transaction support, so each entry is written with its own statement: a
+// failure leaves previously written entries committed and the returned error
+// names the failing index. Callers that need all-or-nothing semantics must
+// serialize the batch themselves.
+func (w *Writer) UpsertPositions(ctx context.Context, positions []Position) error {
+	if err := w.ready(); err != nil {
+		return err
+	}
+	for i, p := range positions {
+		if err := w.upsertPosition(ctx, p); err != nil {
+			return fmt.Errorf("postgres: upsert positions[%d] account=%d symbol=%q: %w",
+				i, p.AccountID, p.Symbol, err)
+		}
+	}
+	return nil
+}
+
+// LoadPositions reads the whole position table ordered by account and symbol.
+// It returns a nil slice when the table is empty.
+func (w *Writer) LoadPositions(ctx context.Context) ([]Position, error) {
+	if err := w.ready(); err != nil {
+		return nil, err
+	}
+
+	rows, err := w.db.QueryContext(ctx, loadPositionsSQL)
+	if err != nil {
+		return nil, fmt.Errorf("postgres: load positions: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	return scanPositions(rows)
+}
+
+func (w *Writer) upsertPosition(ctx context.Context, p Position) error {
+	_, err := w.db.ExecContext(ctx, upsertPositionSQL,
+		p.AccountID,
+		p.Symbol,
+		p.Qty,
+		p.AvgCost,
+		p.Mark,
+		p.Realized,
+		p.UpdatedAt,
+	)
+	return err
+}
+
+// scanPositions drains rows using the column order of loadPositionsSQL.
+func scanPositions(rows Rows) ([]Position, error) {
+	var out []Position
+	for rows.Next() {
+		var p Position
+		if err := rows.Scan(
+			&p.AccountID,
+			&p.Symbol,
+			&p.Qty,
+			&p.AvgCost,
+			&p.Mark,
+			&p.Realized,
+			&p.UpdatedAt,
+		); err != nil {
+			return nil, fmt.Errorf("postgres: load positions: scan: %w", err)
+		}
+		out = append(out, p)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("postgres: load positions: %w", err)
+	}
+	return out, nil
+}
+
 func (w *Writer) ready() error {
 	if w == nil {
 		return ErrNilWriter
@@ -272,3 +366,30 @@ const insertExecEventSQL = `INSERT INTO exec_events (
 	reported_at
 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
 ON CONFLICT (exec_id) DO NOTHING`
+
+const upsertPositionSQL = `INSERT INTO positions (
+	account_id,
+	symbol,
+	qty,
+	avg_cost,
+	mark,
+	realized,
+	updated_at
+) VALUES ($1, $2, $3, $4, $5, $6, $7)
+ON CONFLICT (account_id, symbol) DO UPDATE SET
+	qty = EXCLUDED.qty,
+	avg_cost = EXCLUDED.avg_cost,
+	mark = EXCLUDED.mark,
+	realized = EXCLUDED.realized,
+	updated_at = EXCLUDED.updated_at`
+
+const loadPositionsSQL = `SELECT
+	account_id,
+	symbol,
+	qty,
+	avg_cost,
+	mark,
+	realized,
+	updated_at
+FROM positions
+ORDER BY account_id, symbol`
