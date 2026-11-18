@@ -144,7 +144,7 @@ func TestValidClientOrderID(t *testing.T) {
 		{name: "empty", id: "", want: false},
 		{name: "37 chars", id: strings.Repeat("a", 37), want: false},
 		{name: "space", id: "client 7", want: false},
-		{name: "unicode", id: "订单1", want: false},
+		{name: "non ascii", id: "\u8ba2\u53551", want: false},
 	}
 
 	for _, tt := range tests {

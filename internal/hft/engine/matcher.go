@@ -45,6 +45,11 @@ type SubmitResult struct {
 	OpenLeaves  int64
 	CanceledQty int64 // 被策略取消的量（IOC/MARKET 可能 >0）
 	FinalStatus OrderStatus
+
+	// MakerReports carries one execution report per resting order that this
+	// order filled. Without them the position ledger would only ever see the
+	// taker side, so a user whose bid gets hit would never show a position.
+	MakerReports []ExecReport
 }
 
 func NewMatcher(ob *OrderBook) *Matcher {
@@ -103,8 +108,15 @@ func (m *Matcher) RestingOrderCount() int {
 // generated trades plus the taker quantity that could not be filled.
 // FOK orders are rejected up front when the book cannot fill them in full.
 func (m *Matcher) Match(ctx context.Context, order Order) ([]Trade, int64, error) {
+	trades, remaining, _, err := m.match(ctx, order)
+	return trades, remaining, err
+}
+
+// match is the internal form of Match. It also returns the execution reports
+// generated for the resting orders this order consumed.
+func (m *Matcher) match(ctx context.Context, order Order) ([]Trade, int64, []ExecReport, error) {
 	if ctx.Err() != nil {
-		return nil, 0, ctx.Err()
+		return nil, 0, nil, ctx.Err()
 	}
 
 	// order.Price is already an integer price unit.
@@ -112,10 +124,10 @@ func (m *Matcher) Match(ctx context.Context, order Order) ([]Trade, int64, error
 
 	qtyInt, err := ParseQuantity(order.Quantity, m.ob.quantityPrecision)
 	if err != nil {
-		return nil, 0, err
+		return nil, 0, nil, err
 	}
 	if qtyInt <= 0 {
-		return nil, 0, errors.New("quantity must be positive")
+		return nil, 0, nil, errors.New("quantity must be positive")
 	}
 
 	m.mu.Lock()
@@ -123,10 +135,11 @@ func (m *Matcher) Match(ctx context.Context, order Order) ([]Trade, int64, error
 
 	// FOK is all-or-nothing: reject before touching book or queues.
 	if order.TIF == TimeInForceFOK && !m.hasLiquidityLocked(order, priceInt, qtyInt) {
-		return nil, 0, ErrFOKNotFillable
+		return nil, 0, nil, ErrFOKNotFillable
 	}
 
 	var trades []Trade
+	var makerReports []ExecReport
 	remainingQty := qtyInt
 
 	for remainingQty > 0 {
@@ -143,7 +156,7 @@ func (m *Matcher) Match(ctx context.Context, order Order) ([]Trade, int64, error
 		price := best.Price
 		var filled int64
 		if len(m.restingQueue(order.Side)[price]) > 0 {
-			filled = m.matchQueueLocked(order, price, remainingQty, &trades)
+			filled = m.matchQueueLocked(order, price, remainingQty, &trades, &makerReports)
 		}
 		if filled == 0 {
 			// Aggregate fallback for levels without FIFO entries, for example a
@@ -159,7 +172,7 @@ func (m *Matcher) Match(ctx context.Context, order Order) ([]Trade, int64, error
 		remainingQty -= filled
 	}
 
-	return trades, remainingQty, nil
+	return trades, remainingQty, makerReports, nil
 }
 
 // bestOpposite returns the best level on the side the taker consumes.
@@ -181,7 +194,7 @@ func (m *Matcher) restingQueue(takerSide Side) map[int64][]uint64 {
 // matchQueueLocked fills the taker against the FIFO queue at price and returns
 // the filled quantity. A partially filled maker stays at the head; a fully
 // filled maker is popped and dropped from activeOrders.
-func (m *Matcher) matchQueueLocked(taker Order, price, remaining int64, trades *[]Trade) int64 {
+func (m *Matcher) matchQueueLocked(taker Order, price, remaining int64, trades *[]Trade, makerReports *[]ExecReport) int64 {
 	queues := m.restingQueue(taker.Side)
 	queue := queues[price]
 
@@ -210,7 +223,9 @@ func (m *Matcher) matchQueueLocked(taker Order, price, remaining int64, trades *
 			maker.Status = OrderStatusPartiallyFilled
 		}
 
-		*trades = append(*trades, m.newTradeLocked(taker, maker, price, fillQty))
+		trade := m.newTradeLocked(taker, maker, price, fillQty)
+		*trades = append(*trades, trade)
+		*makerReports = append(*makerReports, execReportForMaker(maker, trade, price, fillQty))
 		m.removeAggregateLocked(oppositeSide(taker.Side), price, fillQty)
 		filled += fillQty
 		remaining -= fillQty
@@ -222,6 +237,32 @@ func (m *Matcher) matchQueueLocked(taker Order, price, remaining int64, trades *
 		queues[price] = queue
 	}
 	return filled
+}
+
+// execReportForMaker renders the execution report for a resting order that a
+// taker just filled. Maker.Filled/Leaves already reflect the fill.
+func execReportForMaker(maker *Order, trade Trade, price, fillQty int64) ExecReport {
+	tradeCopy := trade
+	return ExecReport{
+		OrderID:       maker.ID,
+		ClientOrderID: maker.ClientOrderID,
+		AccountID:     maker.AccountID,
+		Symbol:        maker.Symbol,
+		Side:          maker.Side,
+		Status:        maker.Status,
+		Filled:        maker.Filled,
+		Leaves:        maker.Leaves,
+		LastPx:        price,
+		LastQty:       fillQty,
+		CumQty:        maker.Filled,
+		LeavesQty:     maker.Leaves,
+		OrderPx:       maker.Price,
+		OrderType:     maker.Type,
+		TIF:           maker.TIF,
+		Quantity:      maker.Quantity,
+		Trade:         &tradeCopy,
+		Timestamp:     time.Now().UnixNano(),
+	}
 }
 
 // newTradeLocked builds a trade. A nil maker means aggregate matching, where
@@ -380,15 +421,16 @@ func (m *Matcher) SubmitOrder(ctx context.Context, order Order) ([]Trade, error)
 
 // SubmitOrderDetailed 返回生产执行回报所需的完整语义。
 func (m *Matcher) SubmitOrderDetailed(ctx context.Context, order Order) (SubmitResult, error) {
-	trades, remainingQty, err := m.Match(ctx, order)
+	trades, remainingQty, makerReports, err := m.match(ctx, order)
 	if err != nil {
 		return SubmitResult{}, err
 	}
 
 	executed := sumExecutedQty(trades)
 	result := SubmitResult{
-		Trades:      trades,
-		ExecutedQty: executed,
+		Trades:       trades,
+		ExecutedQty:  executed,
+		MakerReports: makerReports,
 	}
 
 	// 处理剩余订单

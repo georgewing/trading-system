@@ -294,8 +294,7 @@ func (v *Venue) orderParams(order engine.Order, requestedLots int64) (url.Values
 	return params, nil
 }
 
-// orderResponse is the newOrderRespType=FULL response (and the cancel
-// response, which shares the leading fields).
+// orderResponse is the newOrderRespType=FULL response.
 type orderResponse struct {
 	Symbol              string         `json:"symbol"`
 	OrderID             uint64         `json:"orderId"`
@@ -416,8 +415,9 @@ func (v *Venue) Cancel(ctx context.Context, req execution.CancelRequest) error {
 		target = "orderId=" + strconv.FormatUint(req.OrderID, 10)
 	}
 
-	var resp orderResponse
-	if err := v.doSigned(ctx, http.MethodDelete, orderPath, params, &resp); err != nil {
+	// The cancel response body is not needed; treating an empty 200 as success
+	// keeps the gateway tolerant of proxies that strip the body.
+	if err := v.doSigned(ctx, http.MethodDelete, orderPath, params, nil); err != nil {
 		return fmt.Errorf("binance: cancel %s: %w", target, err)
 	}
 	return nil

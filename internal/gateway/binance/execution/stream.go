@@ -32,6 +32,11 @@ const userStreamWSPath = "/ws/"
 // Sending to out applies backpressure: the caller must drain the channel
 // promptly. The stream returns nil on graceful shutdown (ctx canceled) and
 // only returns an error for an unusable call, for example a nil channel.
+//
+// Events produced while the session is down (between a disconnect and the
+// reconnect) are not replayed by Binance. The application is expected to
+// reconcile open orders over REST after a reconnect; this package does not do
+// that because it is deliberately free of order-state ownership.
 func (v *Venue) RunUserStream(ctx context.Context, out chan<- engine.ExecReport) error {
 	if out == nil {
 		return ErrNilReportChannel

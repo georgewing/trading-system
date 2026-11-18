@@ -1,3 +1,8 @@
+// These tests exercise the REST surface and the user stream against local
+// httptest servers, including the websocket handshake, malformed frames and a
+// listenKeyExpired reconnect. The live Binance testnet path (TLS, real listen
+// keys, the 30 minute keepalive interval) is not exercised here; keepalive
+// requests are covered by calling keepAliveListenKey directly.
 package binanceexec
 
 import (

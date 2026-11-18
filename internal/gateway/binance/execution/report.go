@@ -54,6 +54,9 @@ type execEvent struct {
 //   - ErrListenKeyExpired for Binance's listenKeyExpired event;
 //   - ErrInvalidConfig when cfg scales are not positive powers of ten.
 //
+// Frames whose side, execution type or status this gateway cannot represent
+// are rejected instead of being coerced, so the caller can log and count them.
+//
 // Report correlation: OrderID is taken from the client order id when it parses
 // as a uint64 (Submit defaults newClientOrderId to the decimal engine order id),
 // otherwise from Binance's numeric order id. When a caller supplies a

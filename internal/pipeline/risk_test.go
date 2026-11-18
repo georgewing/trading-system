@@ -133,8 +133,11 @@ func submitAndDrain(t *testing.T, bus *EventBus, order engine.Order) {
 func singleReport(t *testing.T, bus *EventBus) engine.ExecReport {
 	t.Helper()
 
-	if got := bus.Outbound().Len(); got != 1 {
-		t.Fatalf("outbound queue length = %d, want 1", got)
+	// Maker reports are enqueued after the taker's own report, so a fill against
+	// resting orders legitimately produces more than one entry. The first one is
+	// always the order under test.
+	if got := bus.Outbound().Len(); got < 1 {
+		t.Fatalf("outbound queue length = %d, want at least 1", got)
 	}
 	report, ok := bus.Outbound().Dequeue()
 	if !ok {
@@ -265,6 +268,11 @@ func TestEventBusRiskApprovalMatchesOrder(t *testing.T) {
 		Quantity:      "2",
 	}
 	submitAndDrain(t, bus, order)
+
+	// The resting sell is a maker now: it gets its own report.
+	if got := bus.Outbound().Len(); got != 2 {
+		t.Fatalf("outbound queue length = %d, want 2 (taker + maker)", got)
+	}
 
 	report := singleReport(t, bus)
 	if report.Status != engine.OrderStatusFilled {

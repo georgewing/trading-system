@@ -308,6 +308,14 @@ func (b *EventBus) publishResult(ctx context.Context, cmd OrderCommand, result e
 			logEnqueueFailure(report, err)
 		}
 	}
+
+	// Resting orders that this order filled need their own reports, otherwise
+	// the position ledger only ever sees the taker side.
+	for _, report := range result.MakerReports {
+		if err := b.PublishReport(ctx, report); err != nil {
+			logEnqueueFailure(report, err)
+		}
+	}
 }
 
 // PublishReport injects an execution report produced outside the matching

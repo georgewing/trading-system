@@ -4,8 +4,10 @@ server:
 
 matcher:
   symbol: "BTCUSDT"
-  price_precision: 8
-  quantity_precision: 8
+  # Kept small on purpose: the position ledger multiplies price ticks by lots,
+  # so 8/8 would overflow int64 for BTC-sized notionals.
+  price_precision: 2
+  quantity_precision: 6
 
 market:
   enabled: false

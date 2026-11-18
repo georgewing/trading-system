@@ -14,6 +14,7 @@ import (
 	"reflect"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -108,12 +109,12 @@ func requireSignedQuery(t *testing.T, r *http.Request) url.Values {
 }
 
 func TestSubmitNewLimitOrder(t *testing.T) {
-	var got url.Values
+	queries := make(chan url.Values, 1)
 	venue := newTestVenue(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost || r.URL.Path != orderPath {
 			t.Errorf("request = %s %s, want POST %s", r.Method, r.URL.Path, orderPath)
 		}
-		got = requireSignedQuery(t, r)
+		queries <- requireSignedQuery(t, r)
 		writeJSON(w, `{
 			"symbol":"BTCUSDT","orderId":42,"clientOrderId":"1001",
 			"transactTime":1700000000123,"price":"25000.12000000",
@@ -136,9 +137,7 @@ func TestSubmitNewLimitOrder(t *testing.T) {
 		t.Fatalf("Submit() = %+v, want %+v", result, want)
 	}
 
-	if got == nil {
-		t.Fatal("handler did not capture the request")
-	}
+	got := <-queries
 	for key, want := range map[string]string{
 		"symbol":           "BTCUSDT",
 		"side":             "BUY",
@@ -169,9 +168,9 @@ func TestSubmitFilledOrder(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			var got url.Values
+			queries := make(chan url.Values, 1)
 			venue := newTestVenue(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				got = requireSignedQuery(t, r)
+				queries <- requireSignedQuery(t, r)
 				writeJSON(w, `{
 					"symbol":"BTCUSDT","orderId":42,"clientOrderId":"client-7",
 					"transactTime":1700000000123,"price":"25000.12000000",
@@ -193,6 +192,7 @@ func TestSubmitFilledOrder(t *testing.T) {
 				t.Fatalf("Submit() error = %v", err)
 			}
 
+			got := <-queries
 			if got.Get("newClientOrderId") != "client-7" {
 				t.Fatalf("newClientOrderId = %q, want client-7", got.Get("newClientOrderId"))
 			}
@@ -238,9 +238,9 @@ func TestSubmitFilledOrder(t *testing.T) {
 }
 
 func TestSubmitMarketOrderOmitsPriceAndTIF(t *testing.T) {
-	var got url.Values
+	queries := make(chan url.Values, 1)
 	venue := newTestVenue(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		got = requireSignedQuery(t, r)
+		queries <- requireSignedQuery(t, r)
 		writeJSON(w, `{
 			"symbol":"BTCUSDT","orderId":43,"clientOrderId":"1001",
 			"transactTime":1700000000123,"price":"0.00000000",
@@ -263,6 +263,7 @@ func TestSubmitMarketOrderOmitsPriceAndTIF(t *testing.T) {
 		t.Fatalf("Submit() error = %v", err)
 	}
 
+	got := <-queries
 	if got.Get("type") != "MARKET" {
 		t.Errorf("type = %q, want MARKET", got.Get("type"))
 	}
@@ -278,9 +279,9 @@ func TestSubmitMarketOrderOmitsPriceAndTIF(t *testing.T) {
 }
 
 func TestSubmitPostOnlyMapsToLimitMaker(t *testing.T) {
-	var got url.Values
+	queries := make(chan url.Values, 1)
 	venue := newTestVenue(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		got = requireSignedQuery(t, r)
+		queries <- requireSignedQuery(t, r)
 		writeJSON(w, `{
 			"symbol":"BTCUSDT","orderId":44,"clientOrderId":"1001",
 			"transactTime":1700000000123,"price":"25000.12000000",
@@ -297,6 +298,7 @@ func TestSubmitPostOnlyMapsToLimitMaker(t *testing.T) {
 		t.Fatalf("Submit() error = %v", err)
 	}
 
+	got := <-queries
 	if got.Get("type") != "LIMIT_MAKER" {
 		t.Fatalf("type = %q, want LIMIT_MAKER", got.Get("type"))
 	}
@@ -420,14 +422,12 @@ func TestSubmitContextCanceled(t *testing.T) {
 func TestSignedRequestsUseServerClock(t *testing.T) {
 	const skew = 5 * time.Minute
 
-	var (
-		timeCalls int
-		timestamp int64
-	)
+	var timeCalls atomic.Int32
+	timestamps := make(chan int64, 2)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case timePath:
-			timeCalls++
+			timeCalls.Add(1)
 			writeJSON(w, fmt.Sprintf(`{"serverTime":%d}`, time.Now().Add(skew).UnixMilli()))
 		case orderPath:
 			query := requireSignedQuery(t, r)
@@ -435,7 +435,7 @@ func TestSignedRequestsUseServerClock(t *testing.T) {
 			if err != nil {
 				t.Errorf("parse timestamp %q: %v", query.Get("timestamp"), err)
 			}
-			timestamp = value
+			timestamps <- value
 			writeJSON(w, `{
 				"symbol":"BTCUSDT","orderId":42,"clientOrderId":"1001",
 				"transactTime":1700000000123,"status":"NEW","fills":[]
@@ -459,9 +459,11 @@ func TestSignedRequestsUseServerClock(t *testing.T) {
 		t.Fatalf("second Submit() error = %v", err)
 	}
 
-	if timeCalls != 1 {
-		t.Fatalf("time endpoint calls = %d, want 1", timeCalls)
+	if calls := timeCalls.Load(); calls != 1 {
+		t.Fatalf("time endpoint calls = %d, want 1", calls)
 	}
+	<-timestamps
+	timestamp := <-timestamps
 	drift := time.Duration(timestamp-time.Now().Add(skew).UnixMilli()) * time.Millisecond
 	if drift < -5*time.Second || drift > 5*time.Second {
 		t.Fatalf("signed timestamp is off by %s from the server clock", drift)
@@ -469,12 +471,12 @@ func TestSignedRequestsUseServerClock(t *testing.T) {
 }
 
 func TestCancelByClientOrderID(t *testing.T) {
-	var got url.Values
+	queries := make(chan url.Values, 1)
 	venue := newTestVenue(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodDelete || r.URL.Path != orderPath {
 			t.Errorf("request = %s %s, want DELETE %s", r.Method, r.URL.Path, orderPath)
 		}
-		got = requireSignedQuery(t, r)
+		queries <- requireSignedQuery(t, r)
 		writeJSON(w, `{"symbol":"BTCUSDT","orderId":42,"clientOrderId":"client-7","status":"CANCELED"}`)
 	}))
 
@@ -488,6 +490,7 @@ func TestCancelByClientOrderID(t *testing.T) {
 		t.Fatalf("Cancel() error = %v", err)
 	}
 
+	got := <-queries
 	if got.Get("symbol") != "BTCUSDT" {
 		t.Errorf("symbol = %q, want BTCUSDT", got.Get("symbol"))
 	}
@@ -500,9 +503,9 @@ func TestCancelByClientOrderID(t *testing.T) {
 }
 
 func TestCancelByOrderID(t *testing.T) {
-	var got url.Values
+	queries := make(chan url.Values, 1)
 	venue := newTestVenue(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		got = requireSignedQuery(t, r)
+		queries <- requireSignedQuery(t, r)
 		writeJSON(w, `{"symbol":"BTCUSDT","orderId":42,"status":"CANCELED"}`)
 	}))
 
@@ -510,6 +513,7 @@ func TestCancelByOrderID(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Cancel() error = %v", err)
 	}
+	got := <-queries
 	if got.Get("orderId") != "42" {
 		t.Fatalf("orderId = %q, want 42", got.Get("orderId"))
 	}
@@ -537,6 +541,34 @@ func TestCancelUnknownOrder(t *testing.T) {
 		t.Fatalf("Cancel() error = %v, want *APIError with code -2011", err)
 	}
 	requireNoSecrets(t, err)
+}
+
+func TestSubmitAPIErrorWithoutJSONBody(t *testing.T) {
+	venue := newTestVenue(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadGateway)
+		_, _ = io.WriteString(w, "<html>bad gateway</html>")
+	}))
+
+	_, err := venue.Submit(context.Background(), validOrder())
+
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) {
+		t.Fatalf("Submit() error = %v, want *APIError", err)
+	}
+	if apiErr.HTTPStatus != http.StatusBadGateway || apiErr.Code != 0 {
+		t.Fatalf("APIError = %+v, want http 502 and no code", apiErr)
+	}
+	requireNoSecrets(t, err)
+}
+
+func TestCancelAcceptsEmptySuccessBody(t *testing.T) {
+	venue := newTestVenue(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	if err := venue.Cancel(context.Background(), execution.CancelRequest{OrderID: 42, Symbol: "BTCUSDT"}); err != nil {
+		t.Fatalf("Cancel() error = %v, want nil for an empty 200", err)
+	}
 }
 
 func TestCancelRejectsInvalidRequest(t *testing.T) {
