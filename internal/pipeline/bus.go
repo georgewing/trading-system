@@ -15,6 +15,7 @@ import (
 var (
 	ErrInboundQueueFull  = errors.New("eventbus inbound queue full")
 	ErrOutboundQueueFull = errors.New("eventbus outbound queue full")
+	ErrShuttingDown      = errors.New("eventbus is shutting down")
 )
 
 type OrderCommand struct {
@@ -58,6 +59,12 @@ type EventBus struct {
 	cfg      EventBusConfig
 	submitMu sync.Mutex // ringbuffer 是 SPSC；多 producer 时必须保护 enqueue
 
+	// riskGuard 为可选的事前风控阶段，nil 表示关闭；只在处理 goroutine 读取。
+	riskGuard         RiskGuard
+	riskQuantityScale int64
+
+	accepting       atomic.Bool
+	processing      atomic.Int64
 	droppedInbound  atomic.Uint64
 	droppedOutbound atomic.Uint64
 }
@@ -94,13 +101,15 @@ func NewEventBusWithConfig(matcher *engine.Matcher, cfg EventBusConfig) *EventBu
 		cfg.RetrySleep = 20 * time.Microsecond
 	}
 
-	return &EventBus{
+	bus := &EventBus{
 		queue:    ringbuffer.New[OrderCommand](cfg.InboundCapacity),
 		matcher:  matcher,
 		outbound: ringbuffer.New[engine.ExecReport](cfg.OutboundCapacity),
 		metrics:  observability.NoopRecorder(),
 		cfg:      cfg,
 	}
+	bus.accepting.Store(true)
+	return bus
 }
 
 // SetMetrics 注入指标采集器，nil 会回退为 noop。
@@ -127,6 +136,11 @@ func (b *EventBus) SubmitWithContext(ctx context.Context, cmd OrderCommand) erro
 		}
 
 		b.submitMu.Lock()
+		if !b.accepting.Load() {
+			b.submitMu.Unlock()
+			b.metrics.IncOrderArrival("rejected")
+			return ErrShuttingDown
+		}
 		ok := b.queue.Enqueue(cmd)
 		b.submitMu.Unlock()
 		if ok {
@@ -142,6 +156,7 @@ func (b *EventBus) SubmitWithContext(ctx context.Context, cmd OrderCommand) erro
 		case <-timer.C:
 			b.droppedInbound.Add(1)
 			b.metrics.IncOrderArrival("rejected")
+			b.metrics.IncQueueDrop("inbound")
 			b.metrics.SetQueueBacklog("inbound", float64(b.queue.Len()))
 			return ErrInboundQueueFull
 		default:
@@ -152,6 +167,31 @@ func (b *EventBus) SubmitWithContext(ctx context.Context, cmd OrderCommand) erro
 
 func (b *EventBus) Outbound() *ringbuffer.RingBuffer[engine.ExecReport] {
 	return b.outbound
+}
+
+// StopAccepting rejects new submissions. It is safe to call more than once.
+func (b *EventBus) StopAccepting() {
+	b.submitMu.Lock()
+	b.accepting.Store(false)
+	b.submitMu.Unlock()
+}
+
+// Drain waits until all accepted commands have been processed and their reports
+// have been enqueued to the outbound queue.
+func (b *EventBus) Drain(ctx context.Context) error {
+	ticker := time.NewTicker(b.cfg.IdleSleep)
+	defer ticker.Stop()
+
+	for {
+		if b.queue.Len() == 0 && b.processing.Load() == 0 {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+		}
+	}
 }
 
 func (b *EventBus) DroppedInbound() uint64 {
@@ -169,35 +209,48 @@ func (b *EventBus) Start(ctx context.Context) {
 			case <-ctx.Done():
 				return
 			default:
+				b.processing.Add(1)
 				cmd, ok := b.queue.Dequeue()
 				if !ok {
+					b.processing.Add(-1)
 					time.Sleep(b.cfg.IdleSleep)
 					continue
 				}
-				b.metrics.SetQueueBacklog("inbound", float64(b.queue.Len()))
-
-				matchStart := time.Now()
-				result, matchErr := b.matcher.SubmitOrderDetailed(ctx, cmd.Order)
-				if matchErr != nil {
-					b.metrics.ObserveMatchLatency("error", time.Since(matchStart))
-				} else {
-					b.metrics.ObserveMatchLatency("ok", time.Since(matchStart))
-				}
-
-				b.sendResult(ctx, cmd.ResultCh, MatchResult{
-					Trades: result.Trades,
-					Err:    matchErr,
-				})
-
-				reports := buildExecReports(cmd.Order, result, matchErr)
-				for _, report := range reports {
-					if err := b.enqueueReport(ctx, report); err != nil {
-						log.Printf("enqueue exec report failed: orderID=%d err=%v", report.OrderID, err)
-					}
-				}
+				b.processCommand(ctx, cmd)
 			}
 		}
 	}()
+}
+
+func (b *EventBus) processCommand(ctx context.Context, cmd OrderCommand) {
+	defer b.processing.Add(-1)
+
+	b.metrics.SetQueueBacklog("inbound", float64(b.queue.Len()))
+
+	if reason, ok := b.checkRisk(ctx, cmd.Order); !ok {
+		b.rejectCommand(ctx, cmd, reason)
+		return
+	}
+
+	matchStart := time.Now()
+	result, matchErr := b.matcher.SubmitOrderDetailed(ctx, cmd.Order)
+	if matchErr != nil {
+		b.metrics.ObserveMatchLatency("error", time.Since(matchStart))
+	} else {
+		b.metrics.ObserveMatchLatency("ok", time.Since(matchStart))
+	}
+
+	b.sendResult(ctx, cmd.ResultCh, MatchResult{
+		Trades: result.Trades,
+		Err:    matchErr,
+	})
+
+	reports := buildExecReports(cmd.Order, result, matchErr)
+	for _, report := range reports {
+		if err := b.enqueueReport(ctx, report); err != nil {
+			logEnqueueFailure(report, err)
+		}
+	}
 }
 
 func (b *EventBus) sendResult(ctx context.Context, ch chan<- MatchResult, r MatchResult) {
@@ -234,6 +287,7 @@ func (b *EventBus) enqueueReport(ctx context.Context, report engine.ExecReport) 
 			return ctx.Err()
 		case <-timer.C:
 			b.droppedOutbound.Add(1)
+			b.metrics.IncQueueDrop("outbound")
 			return ErrOutboundQueueFull
 		default:
 			time.Sleep(b.cfg.RetrySleep)
@@ -303,6 +357,10 @@ func buildExecReports(order engine.Order, result engine.SubmitResult, matchErr e
 	}
 
 	return reports
+}
+
+func logEnqueueFailure(report engine.ExecReport, err error) {
+	log.Printf("enqueue exec report failed: orderID=%d err=%v", report.OrderID, err)
 }
 
 func stopTimer(t *time.Timer) {

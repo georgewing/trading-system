@@ -43,5 +43,4 @@ func main() {
 	if err := app.Run(ctx, cfg); err != nil {
 		log.Fatalf("app run error: %v", err)
 	}
-	log.Println("app started")
 }

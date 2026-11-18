@@ -3,7 +3,6 @@ package engine
 import (
 	"context"
 	"math"
-	"strconv"
 	"sync/atomic"
 	"time"
 
@@ -63,13 +62,11 @@ func (ob *OrderBook) AddOrder(ctx context.Context, order Order) {
 	// order.Price 已经是 int64（以最小价格单位表示），直接使用
 	priceInt := order.Price
 
-	qtyFloat, err := strconv.ParseFloat(order.Quantity, 64)
+	qtyInt, err := ParseQuantity(order.Quantity, ob.quantityPrecision)
 	if err != nil {
-		// 生产环境建议：记录监控日志 + 拒绝订单，这里简化直接返回
-		// 可扩展为返回 error 或通过事件总线发布错误事件
+		// Production should log the reject and publish an error event.
 		return
 	}
-	qtyInt := int64(math.Round(qtyFloat * float64(ob.quantityPrecision)))
 
 	// 实际订单簿更新逻辑（零拷贝、高性能）
 	if order.Side == SideBuy {

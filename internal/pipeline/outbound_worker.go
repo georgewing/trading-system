@@ -61,6 +61,9 @@ type OutboundWorker struct {
 	sinks []sinkRuntime
 	wg    sync.WaitGroup
 
+	stopCh   chan struct{}
+	stopOnce sync.Once
+
 	dispatchDropped atomic.Uint64
 	sinkFailures    atomic.Uint64
 }
@@ -105,11 +108,12 @@ func NewOutboundWorker(
 	}
 
 	return &OutboundWorker{
-		queue: queue,
-		cfg:   cfg,
-		dlq:   dlq,
-		met:   observability.NoopRecorder(),
-		sinks: rt,
+		queue:  queue,
+		cfg:    cfg,
+		dlq:    dlq,
+		met:    observability.NoopRecorder(),
+		sinks:  rt,
+		stopCh: make(chan struct{}),
 	}
 }
 
@@ -124,12 +128,12 @@ func (w *OutboundWorker) SetMetrics(recorder observability.Recorder) {
 
 func (w *OutboundWorker) Start(ctx context.Context) {
 	for i := range w.sinks {
-		sw := w.sinks[i]
+		i := i
 		w.wg.Add(1)
-		go func(sr sinkRuntime) {
+		go func() {
 			defer w.wg.Done()
-			w.runSink(ctx, sr)
-		}(sw)
+			w.runSink(ctx, &w.sinks[i])
+		}()
 	}
 
 	w.wg.Add(1)
@@ -137,6 +141,27 @@ func (w *OutboundWorker) Start(ctx context.Context) {
 		defer w.wg.Done()
 		w.runDispatcher(ctx)
 	}()
+}
+
+// Stop drains the outbound queue and waits for all sinks to finish. The ctx
+// bounds the wait; it does not stop the drain itself.
+func (w *OutboundWorker) Stop(ctx context.Context) error {
+	w.stopOnce.Do(func() {
+		close(w.stopCh)
+	})
+
+	done := make(chan struct{})
+	go func() {
+		w.wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 func (w *OutboundWorker) Wait(ctx context.Context) error {
@@ -163,50 +188,83 @@ func (w *OutboundWorker) SinkFailures() uint64 {
 }
 
 func (w *OutboundWorker) runDispatcher(ctx context.Context) {
+	defer w.closeSinks()
+
 	for {
 		select {
 		case <-ctx.Done():
 			return
+		case <-w.stopCh:
+			w.drainQueue(ctx)
+			return
 		default:
-			if w.queue == nil {
-				time.Sleep(w.cfg.DispatchIdleSleep)
-				continue
-			}
+		}
 
-			report, ok := w.queue.Dequeue()
-			if !ok {
-				time.Sleep(w.cfg.DispatchIdleSleep)
-				continue
-			}
-			w.met.SetQueueBacklog("outbound", float64(w.queue.Len()))
+		if w.queue == nil {
+			time.Sleep(w.cfg.DispatchIdleSleep)
+			continue
+		}
 
-			for _, sr := range w.sinks {
-				timer := time.NewTimer(w.cfg.DispatchTimeout)
-				select {
-				case sr.ch <- report:
-				case <-ctx.Done():
-					stopTimer(timer)
-					return
-				case <-timer.C:
-					w.dispatchDropped.Add(1)
-					w.dlq.HandleDeadLetter(ctx, sr.sink.Name(), report, ErrOutboundQueueFull)
-				}
-				stopTimer(timer)
-			}
+		report, ok := w.queue.Dequeue()
+		if !ok {
+			time.Sleep(w.cfg.DispatchIdleSleep)
+			continue
+		}
+		w.met.SetQueueBacklog("outbound", float64(w.queue.Len()))
+		if !w.dispatch(ctx, report) {
+			return
 		}
 	}
 }
 
-func (w *OutboundWorker) runSink(ctx context.Context, sr sinkRuntime) {
+func (w *OutboundWorker) drainQueue(ctx context.Context) {
+	if w.queue == nil {
+		return
+	}
 	for {
-		select {
-		case <-ctx.Done():
+		report, ok := w.queue.Dequeue()
+		if !ok {
+			w.met.SetQueueBacklog("outbound", 0)
 			return
-		case report := <-sr.ch:
-			if err := w.handleWithRetry(ctx, sr.sink, report); err != nil {
-				w.sinkFailures.Add(1)
-				w.dlq.HandleDeadLetter(ctx, sr.sink.Name(), report, err)
-			}
+		}
+		w.met.SetQueueBacklog("outbound", float64(w.queue.Len()))
+		if !w.dispatch(ctx, report) {
+			return
+		}
+	}
+}
+
+func (w *OutboundWorker) dispatch(ctx context.Context, report engine.ExecReport) bool {
+	for i := range w.sinks {
+		sr := &w.sinks[i]
+		timer := time.NewTimer(w.cfg.DispatchTimeout)
+		select {
+		case sr.ch <- report:
+		case <-ctx.Done():
+			stopTimer(timer)
+			return false
+		case <-timer.C:
+			w.dispatchDropped.Add(1)
+			w.met.IncQueueDrop(sr.sink.Name())
+			w.dlq.HandleDeadLetter(ctx, sr.sink.Name(), report, ErrOutboundQueueFull)
+		}
+		stopTimer(timer)
+	}
+	return true
+}
+
+func (w *OutboundWorker) closeSinks() {
+	for i := range w.sinks {
+		close(w.sinks[i].ch)
+	}
+}
+
+func (w *OutboundWorker) runSink(ctx context.Context, sr *sinkRuntime) {
+	for report := range sr.ch {
+		if err := w.handleWithRetry(ctx, sr.sink, report); err != nil {
+			w.sinkFailures.Add(1)
+			w.met.IncSinkFailure(sr.sink.Name())
+			w.dlq.HandleDeadLetter(ctx, sr.sink.Name(), report, err)
 		}
 	}
 }

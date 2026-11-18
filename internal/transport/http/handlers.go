@@ -4,6 +4,7 @@ package http
 
 import (
 	"encoding/json"
+	"fmt"
 	"math"
 	"net/http"
 	"strconv"
@@ -16,13 +17,15 @@ import (
 
 // 请求/响应结构体（OpenAPI 友好）
 type MatchRequest struct {
-	OrderID     string  `json:"order_id" validate:"required"`
+	OrderID string `json:"order_id" validate:"required"`
+	// AccountID / Symbol 可选：risk 未开启时可省略，Symbol 为空时回退到端点默认交易对。
+	AccountID   uint64  `json:"account_id"`
+	Symbol      string  `json:"symbol"`
 	Side        string  `json:"side" validate:"required,oneof=BUY SELL"`
 	Price       float64 `json:"price" validate:"required,gt=0"`
 	Quantity    string  `json:"quantity" validate:"required"`
 	Type        string  `json:"type" validate:"required,oneof=LIMIT MARKET"`
 	TimeInForce string  `json:"time_in_force" validate:"required,oneof=FOK GTC IOC"`
-	// 未来扩展：ClientOrderID、AccountID、PostOnly 等
 }
 
 type MatchResponse struct {
@@ -39,9 +42,29 @@ type ErrorResponse struct {
 	Message string `json:"message"`
 }
 
-// MakeMatchEndpoint 创建撮合端点 Handler
-// metrics 参数预留（未来注入 Prometheus / observability.Metrics）
-func MakeMatchEndpoint(bus *pipeline.EventBus) http.Handler {
+// Option customizes the match endpoint without breaking existing callers.
+type Option func(*endpointConfig)
+
+type endpointConfig struct {
+	onOrder func(engine.Order)
+}
+
+// WithOrderObserver installs a callback invoked after an order is accepted for
+// processing. The trading terminal uses it to build its order read model.
+func WithOrderObserver(fn func(engine.Order)) Option {
+	return func(c *endpointConfig) { c.onOrder = fn }
+}
+
+// MakeMatchEndpoint 创建撮合端点 Handler。
+// defaultSymbol 用于请求未携带 symbol 的旧客户端（空字符串表示不填充）。
+func MakeMatchEndpoint(bus *pipeline.EventBus, defaultSymbol string, opts ...Option) http.Handler {
+	var cfg endpointConfig
+	for _, opt := range opts {
+		if opt != nil {
+			opt(&cfg)
+		}
+	}
+
 	if bus == nil {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusInternalServerError, "matching bus unavailable")
@@ -97,25 +120,14 @@ func MakeMatchEndpoint(bus *pipeline.EventBus) http.Handler {
 			writeError(w, http.StatusBadRequest, "invalid price")
 			return
 		}
-		// 映射 Side
-		var side engine.Side
-		if req.Side == "BUY" {
-			side = engine.SideBuy
-		} else {
-			side = engine.SideSell
-		}
 
 		orderID := idgen.NextID()
 
-		// 构造领域 Order
-		order := engine.Order{
-			ID:            orderID,
-			Side:          side,
-			Price:         priceInt,
-			Quantity:      req.Quantity,
-			Type:          engine.OrderType(req.Type),
-			TIF:           engine.TimeInForce(req.TimeInForce),
-			ClientOrderID: req.OrderID,
+		// 构造领域 Order；account_id 不做强制校验，由 risk guard 在开启时拒绝。
+		order, err := newOrderFromRequest(req, defaultSymbol, orderID)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
 		}
 
 		cmd := pipeline.OrderCommand{
@@ -126,6 +138,10 @@ func MakeMatchEndpoint(bus *pipeline.EventBus) http.Handler {
 		if err := bus.SubmitWithContext(r.Context(), cmd); err != nil {
 			writeError(w, http.StatusServiceUnavailable, "exchange overload")
 			return
+		}
+
+		if cfg.onOrder != nil {
+			cfg.onOrder(order)
 		}
 
 		w.Header().Set("Content-Type", "application/json")
@@ -140,6 +156,40 @@ func MakeMatchEndpoint(bus *pipeline.EventBus) http.Handler {
 
 		// TODO: 生产中在这里异步推送 WS / ClickHouse
 	})
+}
+
+// newOrderFromRequest maps an already validated MatchRequest into the engine
+// order. An empty Symbol falls back to defaultSymbol. Until multi-symbol routing
+// is wired, a symbol different from defaultSymbol is rejected to prevent orders
+// from hitting the wrong order book.
+func newOrderFromRequest(req MatchRequest, defaultSymbol string, orderID uint64) (engine.Order, error) {
+	symbol := req.Symbol
+	if symbol == "" {
+		symbol = defaultSymbol
+	}
+	if symbol == "" {
+		return engine.Order{}, fmt.Errorf("symbol is required")
+	}
+	if defaultSymbol != "" && symbol != defaultSymbol {
+		return engine.Order{}, fmt.Errorf("unsupported symbol %q, expected %q", symbol, defaultSymbol)
+	}
+
+	side := engine.SideSell
+	if req.Side == "BUY" {
+		side = engine.SideBuy
+	}
+
+	return engine.Order{
+		ID:            orderID,
+		ClientOrderID: req.OrderID,
+		AccountID:     req.AccountID,
+		Symbol:        symbol,
+		Side:          side,
+		Type:          engine.OrderType(req.Type),
+		TIF:           engine.TimeInForce(req.TimeInForce),
+		Price:         int64(req.Price),
+		Quantity:      req.Quantity,
+	}, nil
 }
 
 func writeError(w http.ResponseWriter, status int, msg string) {

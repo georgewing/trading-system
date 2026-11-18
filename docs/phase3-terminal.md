@@ -1,0 +1,134 @@
+# Phase 3: Web Trading Terminal
+
+Status: vertical slice running end-to-end with real Binance market data.
+
+## What runs
+
+| Layer | Package | Notes |
+|---|---|---|
+| Market feed | `internal/gateway/binance` | public combined stream, reconnecting |
+| Market state | `internal/market` | depth / trades / klines, in-memory, fan-out |
+| Order read model | `internal/orders` | submission + latest execution state |
+| WS transport | `internal/transport/ws` | `/ws`, topics, seq, snapshots |
+| REST | `internal/transport/http` | depth, klines, trades, orders, meta |
+| Terminal | `frontend/` | React + TS + lightweight-charts |
+
+## Run
+
+```bash
+# backend (real Binance public streams, no API key)
+SNOWFLAKE_WORKER_ID=1 GOCACHE=/tmp/go-build \
+  go run ./cmd/hft-server -config ./configs/config.example.yaml
+
+# frontend (proxies /api and /ws to :8090)
+cd frontend && npm install && npm run dev
+# open http://127.0.0.1:5173
+```
+
+Dev probes:
+
+```bash
+node scripts/dev/ws-probe.mjs                 # market data over /ws
+node scripts/dev/e2e-order.mjs                # order -> exec report round trip
+go run ./scripts/dev/feedcheck                # feed only, no server
+```
+
+## HTTP
+
+```
+GET  /api/v1/meta                          instrument + precision
+GET  /api/v1/market/depth?symbol=&limit=
+GET  /api/v1/market/kline?symbol=&interval=&limit=
+GET  /api/v1/market/trades?symbol=&limit=
+GET  /api/v1/orders?limit=
+GET  /api/v1/orders/{order_id}
+POST /api/v1/order
+```
+
+`POST /api/v1/order` keeps the existing contract: `price` is integer ticks
+(`price * 10^matcher.price_precision`), `quantity` is a decimal string. The
+response is `202` with the assigned `order_id`; the outcome arrives on `/ws`.
+
+## WebSocket
+
+```
+GET /ws
+```
+
+Client:
+
+```json
+{"op":"sub","topics":["depth:BTCUSDT","trade:BTCUSDT","kline:BTCUSDT:1m","order"],"last_seq":0}
+{"op":"unsub","topics":["trade:BTCUSDT"]}
+{"op":"ping","ts":1700000000000}
+```
+
+Server envelope:
+
+```json
+{"v":1,"seq":42,"ts":1700000000000,"type":"market.depth","symbol":"BTCUSDT","data":{}}
+```
+
+Types: `system.hello`, `system.pong`, `system.error`, `market.depth`,
+`market.trade`, `market.trade.snapshot`, `market.kline`,
+`market.kline.snapshot`, `order.exec`.
+
+### Sequence and resync
+
+`seq` is monotonic per connection.
+
+- Stateful topics (`depth`, `kline`) answer a subscribe with a **full snapshot**.
+- On reconnect the client sends `last_seq`. The server cannot replay events, so
+  it re-sends snapshots and emits `system.error{code:"resync"}`.
+- The client re-subscribes at most once per second, so a lossy link cannot turn
+  into a resubscribe storm.
+
+## Data conventions
+
+- Market prices/quantities travel as **decimal strings**, exactly as the venue
+  published them. Nothing parses them into float on the way in.
+- Order prices travel as **int64 ticks**; order ids are **strings**, because a
+  64-bit snowflake id does not survive a JS number.
+- Times are Unix milliseconds.
+
+## Frontend notes
+
+- `src/store/createStore.ts` is a tiny `useSyncExternalStore` store. High-rate
+  updates never go through React state directly.
+- `src/api/ws.ts` batches one animation frame worth of messages into a single
+  commit; a 100ms depth stream plus a busy tape would otherwise re-render per
+  message.
+- `lightweight-charts` is used for candles; ECharts was rejected as ~20x the
+  bundle for this use case.
+
+## Known gaps
+
+1. **Execution is internal.** Orders match against the in-process paper book,
+   not Binance. Depth and candles are real; fills are simulated. Live execution
+   needs an authenticated venue adapter and is out of scope for this phase.
+2. **No cancel.** The matcher has no `Cancel`; `execution.PaperVenue.Cancel`
+   returns `ErrCancelNotSupported`, and there is no cancel endpoint.
+3. **No positions/accounts.** `risk.Request.CurrentPosition` is never populated,
+   so `max_position` degrades to a per-order quantity cap and the UI has no
+   position panel.
+4. **Single node.** `ws.Hub` and the market store are process-local. The k8s
+   manifest asks for 10 replicas, which would need sticky sessions or a shared
+   bus.
+5. **Depth is a snapshot stream.** Binance's `depth20@100ms` already sends full
+   top-20 snapshots, so no delta reconstruction is needed. A true incremental
+   feed would need sequence-based book maintenance.
+
+## Duplicate work in this tree
+
+`internal/hft/{domain,infra/binance}` contains a second, parallel market-data
+design (integer minimal units, trade + BBO only, injectable `Dialer`). It has no
+network transport, no WS/HTTP surface and no wiring, so it does not run today.
+
+Before both paths grow further, pick one contract:
+
+- **Option A** — keep `internal/hft/domain` as the shared model, extend it with
+  depth/kline kinds, and port `internal/market` onto it.
+- **Option B** — keep `internal/market` (this slice) as the runtime contract and
+  retire the duplicate Binance decoder.
+
+Until then, expect two market models with incompatible price representations.

@@ -12,7 +12,6 @@ package engine
 import (
 	"context"
 	"errors"
-	"math"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -55,11 +54,10 @@ func (m *Matcher) Match(ctx context.Context, order Order) ([]Trade, int64, error
 	// order.Price 已经是 int64（以最小价格单位表示），直接使用
 	priceInt := order.Price
 
-	qtyFloat, err := strconv.ParseFloat(order.Quantity, 64)
+	qtyInt, err := ParseQuantity(order.Quantity, m.ob.quantityPrecision)
 	if err != nil {
-		return nil, 0, errors.New("invalid quantity")
+		return nil, 0, err
 	}
-	qtyInt := int64(math.Round(qtyFloat * float64(m.ob.quantityPrecision)))
 	if qtyInt <= 0 {
 		return nil, 0, errors.New("quantity must be positive")
 	}
@@ -134,6 +132,18 @@ func sumExecutedQty(trades []Trade) int64 {
 		n += trade.Quantity
 	}
 	return n
+}
+
+// ReferencePrice returns the current best bid, or the best ask when no bid
+// exists. It returns 0 when the book is empty.
+func (m *Matcher) ReferencePrice() int64 {
+	if best, ok := m.ob.GetBestBid(); ok {
+		return best.Price
+	}
+	if best, ok := m.ob.GetBestAsk(); ok {
+		return best.Price
+	}
+	return 0
 }
 
 // SubmitOrder 提交订单并执行撮合（生产主入口）

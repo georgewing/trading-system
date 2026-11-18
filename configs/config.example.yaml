@@ -7,9 +7,41 @@ matcher:
   price_precision: 8
   quantity_precision: 8
 
+# Real-time market data feed that backs the trading terminal.
+# Public streams only: no API key is required.
+market:
+  enabled: true
+  provider: "binance"
+  ws_url: "wss://stream.binance.com:9443"
+  symbol: "BTCUSDT"       # empty falls back to matcher.symbol
+  depth_levels: 20        # 5, 10 or 20
+  depth_speed: "100ms"    # 100ms or 1000ms
+  kline_interval: "1m"
+  reconnect_min_seconds: 1
+  reconnect_max_seconds: 30
+  store_trade_cap: 200
+  store_kline_cap: 1000
+
 pipeline:
   inbound_capacity: 1048576
   outbound_capacity: 1048576
+
+# Pre-trade risk checks. Disabled by default; zero/empty values disable
+# individual checks when enabled.
+# Limits use engine integer units:
+#   max_order_qty / max_position: lots (quantity * 10^quantity_precision)
+#   max_notional: price_ticks * qty_lots
+# max_position is evaluated against a zero in-memory position until an account
+# position source is wired.
+risk:
+  enabled: false
+  symbol_whitelist: []
+  max_order_qty: 0
+  max_notional: 0
+  price_band_bps: 0
+  max_orders_per_window: 0
+  window_seconds: 0
+  max_position: 0
 
 storage:
   postgres_dsn: "postgres://user:pass@localhost:5432/trading?sslmode=disable"

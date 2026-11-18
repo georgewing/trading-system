@@ -85,7 +85,7 @@ func (sl *SkipList) Add(price, qty int64) {
 	n := &PriceLevel{
 		Price:   price,
 		Qty:     qty,
-		forward: make([]*PriceLevel, newLevel),
+		forward: make([]*PriceLevel, newLevel+1),
 	}
 
 	for i := 0; i <= newLevel; i++ {
