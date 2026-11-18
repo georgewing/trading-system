@@ -1,3 +1,13 @@
+# IDE / OS
 .idea/
 .workbuddy/
 .DS_Store
+
+# Go build artifacts
+/hft-server
+*.test
+*.out
+
+# Frontend build output
+frontend/node_modules/
+frontend/dist/
