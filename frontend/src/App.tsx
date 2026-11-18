@@ -8,11 +8,18 @@ import { OrderList } from './components/OrderList'
 import { OrderTicket } from './components/OrderTicket'
 import { PositionsPanel } from './components/PositionsPanel'
 import { PriceChart } from './components/PriceChart'
+import { RiskPanel } from './components/RiskPanel'
 import { TradeTape } from './components/TradeTape'
 import { metaStore } from './store/terminal'
 
 function topicsFor(symbol: string): string[] {
-  return [`depth:${symbol}`, `trade:${symbol}`, `kline:${symbol}:1m`, 'order']
+  return [
+    `depth:${symbol}`,
+    `trade:${symbol}`,
+    `kline:${symbol}:1m`,
+    'order',
+    'risk',
+  ]
 }
 
 export default function App() {
@@ -63,6 +70,7 @@ export default function App() {
           <OrderTicket />
           <AccountPanel />
           <PositionsPanel />
+          <RiskPanel />
           <OrderList />
         </div>
       </main>

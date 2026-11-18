@@ -10,8 +10,10 @@ type Config struct {
 	Server    ServerConfig    `yaml:"server"`
 	Matcher   MatcherConfig   `yaml:"matcher"`
 	Market    MarketConfig    `yaml:"market"`
+	Execution ExecutionConfig `yaml:"execution"`
 	Pipeline  PipelineConfig  `yaml:"pipeline"`
 	Routing   RoutingConfig   `yaml:"routing"`
+	Strategy  StrategyConfig  `yaml:"strategy"`
 	Risk      RiskConfig      `yaml:"risk"`
 	Storage   StorageConfig   `yaml:"storage"`
 	WebSocket WebSocketConfig `yaml:"websocket"`
@@ -69,12 +71,28 @@ type PipelineConfig struct {
 	OutboundCapacity uint64 `yaml:"outbound_capacity"`
 }
 
-// RoutingConfig configures order-to-venue routing. Only the internal "paper"
-// venue exists today, so symbol_venues may only reference "paper". An empty
+// RoutingConfig configures order-to-venue routing. "paper" is always
+// available; "binance" exists when execution.binance.enabled is true. An empty
 // default_venue falls back to "paper".
 type RoutingConfig struct {
 	DefaultVenue string            `yaml:"default_venue"`
 	SymbolVenues map[string]string `yaml:"symbol_venues"`
+}
+
+// ExecutionConfig configures external execution venues. Only Binance Spot is
+// supported today; credentials are supplied through environment variables.
+type ExecutionConfig struct {
+	Binance BinanceExecutionConfig `yaml:"binance"`
+}
+
+type BinanceExecutionConfig struct {
+	Enabled             bool   `yaml:"enabled"`
+	BaseURL             string `yaml:"base_url"`
+	WSURL               string `yaml:"ws_url"`
+	AccountID           uint64 `yaml:"account_id"`
+	RecvWindowSeconds   int    `yaml:"recv_window_seconds"`
+	ReconnectMinSeconds int    `yaml:"reconnect_min_seconds"`
+	ReconnectMaxSeconds int    `yaml:"reconnect_max_seconds"`
 }
 
 // RiskConfig configures the optional risk stages. Zero/empty values disable the
@@ -103,6 +121,26 @@ type IntradayRiskConfig struct {
 	MaxDrawdownBps      int64 `yaml:"max_drawdown_bps"`
 	CooldownSeconds     int   `yaml:"cooldown_seconds"`
 	ResumeAuto          bool  `yaml:"resume_auto"`
+}
+
+// StrategyConfig configures the optional live strategy runtime. Only
+// single-symbol strategies are supported live: market_maker and noop.
+type StrategyConfig struct {
+	Enabled bool   `yaml:"enabled"`
+	Name    string `yaml:"name"`
+	// AccountID is required: strategy orders are risk-checked and attributed.
+	AccountID uint64 `yaml:"account_id"`
+	// Symbol defaults to matcher.symbol; another symbol is rejected because the
+	// gateway still serves one book.
+	Symbol string `yaml:"symbol"`
+
+	TimerSeconds        int `yaml:"timer_seconds"`
+	SubmitTimeoutMillis int `yaml:"submit_timeout_millis"`
+	MaxOrderRate        int `yaml:"max_order_rate"`
+	MaxOpenOrders       int `yaml:"max_open_orders"`
+	MaxPanics           int `yaml:"max_panics"`
+
+	Params map[string]string `yaml:"params"`
 }
 
 func Load(path string) (*Config, error) {

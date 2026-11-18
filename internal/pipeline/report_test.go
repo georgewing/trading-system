@@ -123,3 +123,24 @@ func TestQuoteNotional(t *testing.T) {
 		t.Fatalf("quoteNotional(no price scale) = %d, want 0", got)
 	}
 }
+
+func TestAssignReportIdentityIsPerOrder(t *testing.T) {
+	bus := &EventBus{reportSeq: make(map[uint64]uint64)}
+
+	first := engine.ExecReport{OrderID: 7}
+	second := engine.ExecReport{OrderID: 7}
+	other := engine.ExecReport{OrderID: 8}
+	bus.assignReportIdentity(&first)
+	bus.assignReportIdentity(&second)
+	bus.assignReportIdentity(&other)
+
+	if first.Seq != 1 || second.Seq != 2 || other.Seq != 1 {
+		t.Fatalf("seqs = %d/%d/%d, want 1/2/1", first.Seq, second.Seq, other.Seq)
+	}
+	if first.ExecID == 0 || second.ExecID == 0 || other.ExecID == 0 {
+		t.Fatalf("exec ids = %d/%d/%d, want non-zero", first.ExecID, second.ExecID, other.ExecID)
+	}
+	if first.ExecID == second.ExecID || second.ExecID == other.ExecID || first.ExecID == other.ExecID {
+		t.Fatalf("exec ids collide: %d/%d/%d", first.ExecID, second.ExecID, other.ExecID)
+	}
+}

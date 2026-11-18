@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"trading-system/internal/hft/engine"
+	"trading-system/internal/hft/risk"
 	"trading-system/internal/pipeline"
 	"trading-system/internal/storage/clickhouse"
 	"trading-system/internal/storage/postgres"
@@ -28,10 +29,7 @@ func newPersistenceSinks(ctx context.Context, cfg *Config) ([]pipeline.ExecRepor
 	}
 
 	if cfg.Storage.ClickHouseEnabled {
-		timeout := time.Duration(cfg.Storage.ClickHouseTimeoutSeconds) * time.Second
-		if timeout <= 0 {
-			timeout = 5 * time.Second
-		}
+		timeout := clickhouseTimeout(cfg)
 		chWriter, err := clickhouse.NewWriter(clickhouse.Config{
 			URL:      cfg.Storage.ClickHouseURL,
 			Database: cfg.Storage.ClickHouseDatabase,
@@ -62,6 +60,69 @@ func closePGWriter(w *postgres.Writer) {
 	if w != nil {
 		_ = w.Close()
 	}
+}
+
+// clickhouseTimeout normalizes storage.clickhouse_timeout_seconds.
+func clickhouseTimeout(cfg *Config) time.Duration {
+	timeout := time.Duration(cfg.Storage.ClickHouseTimeoutSeconds) * time.Second
+	if timeout <= 0 {
+		timeout = 5 * time.Second
+	}
+	return timeout
+}
+
+// newCHKlineReader builds the read-only history reader. It shares the writer
+// connection settings but reads the kline view, so clickhouse_table (the tick
+// table) is intentionally ignored.
+func newCHKlineReader(cfg *Config) (*clickhouse.Reader, error) {
+	return clickhouse.NewReader(clickhouse.ReaderConfig{
+		URL:      cfg.Storage.ClickHouseURL,
+		Database: cfg.Storage.ClickHouseDatabase,
+		Username: os.Getenv("CLICKHOUSE_USER"),
+		Password: os.Getenv("CLICKHOUSE_PASSWORD"),
+		Timeout:  clickhouseTimeout(cfg),
+	})
+}
+
+func restorePositions(ctx context.Context, w *postgres.Writer, positions *risk.Positions) error {
+	rows, err := w.LoadPositions(ctx)
+	if err != nil {
+		return err
+	}
+
+	entries := make(map[risk.PositionKey]risk.Position, len(rows))
+	for _, row := range rows {
+		entries[risk.PositionKey{AccountID: row.AccountID, Symbol: row.Symbol}] = risk.Position{
+			Qty:      row.Qty,
+			AvgCost:  row.AvgCost,
+			Mark:     row.Mark,
+			Realized: row.Realized,
+		}
+	}
+	positions.Restore(entries)
+	return nil
+}
+
+func persistPositions(ctx context.Context, w *postgres.Writer, positions *risk.Positions) error {
+	snap := positions.SnapshotAll()
+	if len(snap) == 0 {
+		return nil
+	}
+
+	batch := make([]postgres.Position, 0, len(snap))
+	now := time.Now().UTC()
+	for key, pos := range snap {
+		batch = append(batch, postgres.Position{
+			AccountID: key.AccountID,
+			Symbol:    key.Symbol,
+			Qty:       pos.Qty,
+			AvgCost:   pos.AvgCost,
+			Mark:      pos.Mark,
+			Realized:  pos.Realized,
+			UpdatedAt: now,
+		})
+	}
+	return w.UpsertPositions(ctx, batch)
 }
 
 type pgExecSink struct {

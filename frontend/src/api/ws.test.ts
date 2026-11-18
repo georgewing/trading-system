@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
-import type { DepthData, Envelope } from './envelope'
+import type { DepthData, Envelope, RiskEvent } from './envelope'
 import { TradingSocket } from './ws'
 import {
   connectionStore,
@@ -8,6 +8,8 @@ import {
   klinesStore,
   metaStore,
   ordersStore,
+  riskEventStore,
+  setRiskSnapshot,
   tradesStore,
 } from '../store/terminal'
 
@@ -120,6 +122,19 @@ function depthData(updateId: number, bid: string): DepthData {
   }
 }
 
+function riskEvent(ts: number, message = `risk-${ts}`): RiskEvent {
+  return {
+    ts,
+    account_id: 1,
+    symbol: 'BTCUSDT',
+    strategy: 'market_maker',
+    order_id: 123,
+    code: 'MAX_QTY',
+    action: 'REJECT',
+    message,
+  }
+}
+
 beforeEach(() => {
   clockNow = 0
   rafQueue = []
@@ -162,6 +177,7 @@ beforeEach(() => {
   tradesStore.set([])
   klinesStore.set([])
   ordersStore.set([])
+  setRiskSnapshot([])
 })
 
 afterEach(() => {
@@ -280,5 +296,44 @@ describe('TradingSocket sequence gaps', () => {
     expect(connectionStore.get().gaps).toBe(4)
     expect(connectionStore.get().lastSeq).toBe(9)
     expect(depthStore.get()?.last_update_id).toBe(9)
+  })
+})
+
+describe('TradingSocket risk topic', () => {
+  it('batches risk snapshots and live events alongside market data', () => {
+    startSocket(['market.depth', 'risk'])
+    const ws = socketAt(0)
+    ws.open()
+
+    ws.receive(envelope('market.depth', 1, depthData(1, '100.00')))
+    ws.receive(
+      envelope('risk.snapshot', 2, [riskEvent(1), riskEvent(2)]),
+    )
+    ws.receive(envelope('risk.event', 3, riskEvent(3)))
+    ws.receive(envelope('risk.blocked', 4, riskEvent(4)))
+
+    // Nothing reaches the store until the frame is flushed.
+    expect(depthStore.get()).toBeNull()
+    expect(riskEventStore.get().events).toEqual([])
+
+    flushFrame()
+
+    expect(depthStore.get()?.last_update_id).toBe(1)
+    expect(riskEventStore.get().events.map((e) => e.ts)).toEqual([4, 3, 2, 1])
+  })
+
+  it('ignores malformed risk payloads without stalling the batch', () => {
+    startSocket(['market.depth', 'risk'])
+    const ws = socketAt(0)
+    ws.open()
+
+    ws.receive(envelope('market.depth', 1, depthData(1, '100.00')))
+    ws.receive(envelope('risk.event', 2, { nonsense: true }))
+    ws.receive(envelope('risk.snapshot', 3, 'not an array'))
+
+    flushFrame()
+
+    expect(depthStore.get()?.last_update_id).toBe(1)
+    expect(riskEventStore.get().events).toEqual([])
   })
 })

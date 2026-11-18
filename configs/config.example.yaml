@@ -26,15 +26,27 @@ pipeline:
   inbound_capacity: 1048576
   outbound_capacity: 1048576
 
-# Order routing between execution venues. The internal paper venue is the only
-# venue today; symbol_venues may only map to "paper". An empty default_venue
-# falls back to "paper".
+# Order routing between execution venues. "paper" is always available;
+# "binance" exists when execution.binance.enabled is true. An empty
+# default_venue falls back to "paper".
 routing:
   default_venue: "paper"
   symbol_venues: {}
   # Example: pin a symbol explicitly (the venue must be configured).
   # symbol_venues:
   #   BTCUSDT: "paper"
+
+# External execution venues. Credentials come from BINANCE_API_KEY and
+# BINANCE_API_SECRET; never place secrets in this file.
+execution:
+  binance:
+    enabled: false
+    base_url: "https://testnet.binance.vision"
+    ws_url: "wss://stream.testnet.binance.vision"
+    account_id: 0
+    recv_window_seconds: 5
+    reconnect_min_seconds: 1
+    reconnect_max_seconds: 10
 
 # Risk checks. Disabled by default; zero/empty values disable individual checks
 # when enabled.

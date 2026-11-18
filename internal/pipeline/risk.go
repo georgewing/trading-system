@@ -81,6 +81,7 @@ func (b *EventBus) checkRisk(ctx context.Context, order engine.Order) (string, b
 
 	decision := guard.Check(ctx, risk.Request{
 		AccountID:      order.AccountID,
+		Strategy:       order.Strategy,
 		ClientOrderID:  order.ClientOrderID,
 		Symbol:         order.Symbol,
 		Side:           order.Side,
@@ -148,6 +149,7 @@ func (b *EventBus) rejectCommand(ctx context.Context, cmd OrderCommand, reason s
 	b.sendResult(ctx, cmd.ResultCh, MatchResult{Err: rejectErr})
 
 	for _, report := range buildExecReports(cmd.Order, engine.SubmitResult{}, rejectErr, "") {
+		b.assignReportIdentity(&report)
 		if err := b.enqueueReport(ctx, report); err != nil {
 			logEnqueueFailure(report, err)
 		}

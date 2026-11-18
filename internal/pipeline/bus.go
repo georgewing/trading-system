@@ -60,6 +60,9 @@ type EventBus struct {
 	submitMu sync.Mutex // ringbuffer 是 SPSC；多 producer 时必须保护 enqueue
 	reportMu sync.Mutex // serializes outbound enqueue from the bus and external venues
 
+	reportSeqMu sync.Mutex
+	reportSeq   map[uint64]uint64
+
 	// riskGuard 为可选的事前风控阶段，nil 表示关闭；只在处理 goroutine 读取。
 	riskGuard         RiskGuard
 	riskQuantityScale int64
@@ -111,11 +114,12 @@ func NewEventBusWithConfig(matcher *engine.Matcher, cfg EventBusConfig) *EventBu
 	}
 
 	bus := &EventBus{
-		queue:    ringbuffer.New[OrderCommand](cfg.InboundCapacity),
-		matcher:  matcher,
-		outbound: ringbuffer.New[engine.ExecReport](cfg.OutboundCapacity),
-		metrics:  observability.NoopRecorder(),
-		cfg:      cfg,
+		queue:     ringbuffer.New[OrderCommand](cfg.InboundCapacity),
+		matcher:   matcher,
+		outbound:  ringbuffer.New[engine.ExecReport](cfg.OutboundCapacity),
+		metrics:   observability.NoopRecorder(),
+		cfg:       cfg,
+		reportSeq: make(map[uint64]uint64),
 	}
 	bus.accepting.Store(true)
 	return bus
@@ -298,7 +302,16 @@ func (b *EventBus) publishResult(ctx context.Context, cmd OrderCommand, result e
 		Err:    submitErr,
 	})
 
+	// When the matcher emits separate maker reports, the taker's own report must
+	// not also book the maker leg: risk would count the same fill twice. Venues
+	// that report both sides in one message leave MakerReports empty and keep the
+	// combined behaviour.
+	makerReported := len(result.MakerReports) > 0
+
 	for _, report := range buildExecReports(cmd.Order, result, submitErr, venue) {
+		if makerReported {
+			report.MakerReported = true
+		}
 		// Account for fills before enqueueing: outbound enqueue can drop under
 		// backpressure, but positions and risk state must not.
 		if b.riskObserver != nil {
@@ -322,18 +335,17 @@ func (b *EventBus) publishResult(ctx context.Context, cmd OrderCommand, result e
 // goroutine, for example by an external venue's user-data stream. It updates
 // risk state and enqueues the report to the same outbound sinks as paper fills.
 func (b *EventBus) PublishReport(ctx context.Context, report engine.ExecReport) error {
-	if report.Timestamp == 0 {
-		report.Timestamp = time.Now().UnixNano()
+	if report.Venue == "" {
+		report.Venue = "internal"
 	}
-	if report.ExecID == 0 {
-		report.ExecID = nextExecID()
-	}
+	b.assignReportIdentity(&report)
 
 	order := engine.Order{
 		ID:            report.OrderID,
 		ClientOrderID: report.ClientOrderID,
 		AccountID:     report.AccountID,
 		Symbol:        report.Symbol,
+		Strategy:      report.Strategy,
 		Side:          report.Side,
 		Type:          report.OrderType,
 		TIF:           report.TIF,
@@ -394,6 +406,23 @@ func (b *EventBus) CancelOrder(ctx context.Context, orderID uint64, reason strin
 		return report, err
 	}
 	return report, nil
+}
+
+func (b *EventBus) assignReportIdentity(report *engine.ExecReport) {
+	if report.Timestamp == 0 {
+		report.Timestamp = time.Now().UnixNano()
+	}
+
+	b.reportSeqMu.Lock()
+	if b.reportSeq == nil {
+		b.reportSeq = make(map[uint64]uint64)
+	}
+	b.reportSeq[report.OrderID]++
+	seq := b.reportSeq[report.OrderID]
+	b.reportSeqMu.Unlock()
+
+	report.ExecID = nextExecID()
+	report.Seq = seq
 }
 
 func (b *EventBus) sendResult(ctx context.Context, ch chan<- MatchResult, r MatchResult) {
@@ -490,6 +519,14 @@ func buildExecReports(order engine.Order, result engine.SubmitResult, matchErr e
 		))
 	}
 
+	// The matcher reports maker fills separately, so the taker report must not
+	// also book the maker leg.
+	if len(result.MakerReports) > 0 {
+		for i := range reports {
+			reports[i].MakerReported = true
+		}
+	}
+
 	return reports
 }
 
@@ -525,6 +562,7 @@ func newExecReport(
 		ClientOrderID: order.ClientOrderID,
 		AccountID:     order.AccountID,
 		Symbol:        order.Symbol,
+		Strategy:      order.Strategy,
 		Side:          order.Side,
 		ExecType:      execType,
 		Status:        status,

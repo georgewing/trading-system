@@ -274,6 +274,9 @@ func (g *guardedContext) Position(symbol string) int64 { return g.base.Position(
 func (g *guardedContext) Book(symbol string) (BookView, bool) { return g.base.Book(symbol) }
 
 func (g *guardedContext) Submit(req OrderRequest) (SubmitResult, error) {
+	if req.Strategy == "" {
+		req.Strategy = g.runner.name()
+	}
 	if err := g.runner.beforeSubmit(req); err != nil {
 		return SubmitResult{}, err
 	}

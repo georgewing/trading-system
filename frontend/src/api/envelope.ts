@@ -92,6 +92,31 @@ export interface ExecReport {
   trade?: ExecTrade
 }
 
+/** What the risk engine decided about one order or one strategy tick. */
+export type RiskAction = 'ALLOW' | 'REJECT' | 'CANCEL_ONLY' | 'PAUSE' | 'HALT'
+
+/**
+ * One risk decision. REST rows carry an `id`; WebSocket events do not, so the
+ * store falls back to a content key for de-duplication.
+ */
+export interface RiskEvent {
+  id?: number
+  ts: number
+  account_id: number
+  symbol: string
+  strategy?: string
+  order_id?: number
+  code: string
+  action: RiskAction
+  message: string
+}
+
+/** Payload of `risk.snapshot`: recent history, newest first. */
+export type RiskSnapshot = RiskEvent[]
+
+/** WebSocket message types owned by the risk topic. */
+export type RiskMessageType = 'risk.snapshot' | 'risk.blocked' | 'risk.event'
+
 export interface OrderRow {
   order_id: string
   client_order_id?: string

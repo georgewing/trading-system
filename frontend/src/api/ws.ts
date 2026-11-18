@@ -6,10 +6,12 @@ import type {
   HelloPayload,
   KlineData,
   KlineSnapshot,
+  RiskEvent,
   TradeData,
   TradeSnapshot,
 } from './envelope'
 import {
+  appendRiskEvents,
   connectionStore,
   execTickStore,
   mergeKlines,
@@ -18,8 +20,10 @@ import {
   replaceKlines,
   replaceTrades,
   setDepth,
+  setRiskSnapshot,
   upsertExecReport,
 } from '../store/terminal'
+import { parseRiskEvent, parseRiskSnapshot } from '../lib/risk'
 
 const MIN_BACKOFF_MS = 500
 const MAX_BACKOFF_MS = 15000
@@ -37,6 +41,8 @@ interface Batch {
   klines: KlineData[] | null
   klineAppend: KlineData[]
   orders: ExecReport[]
+  riskSnapshot: RiskEvent[] | null
+  riskEvents: RiskEvent[]
   lastSeq: number
   gaps: number
 }
@@ -49,6 +55,8 @@ function emptyBatch(lastSeq: number): Batch {
     klines: null,
     klineAppend: [],
     orders: [],
+    riskSnapshot: null,
+    riskEvents: [],
     lastSeq,
     gaps: 0,
   }
@@ -218,6 +226,15 @@ export class TradingSocket {
       case 'order.exec':
         this.batch.orders.push(env.data as ExecReport)
         break
+      case 'risk.snapshot':
+        this.batch.riskSnapshot = parseRiskSnapshot(env.data)
+        break
+      case 'risk.blocked':
+      case 'risk.event': {
+        const event = parseRiskEvent(env.data)
+        if (event) this.batch.riskEvents.push(event)
+        break
+      }
       default:
         break
     }
@@ -249,8 +266,13 @@ export class TradingSocket {
     if (batch.tradeAppend.length > 0) prependTrades(batch.tradeAppend)
     if (batch.klines) replaceKlines(batch.klines)
     if (batch.klineAppend.length > 0) mergeKlines(batch.klineAppend)
-  	  for (const report of batch.orders) upsertExecReport(report)
-  	  if (batch.orders.length > 0) execTickStore.set((n) => n + 1)
+    for (const report of batch.orders) upsertExecReport(report)
+    if (batch.orders.length > 0) execTickStore.set((n) => n + 1)
+
+    // Risk history is independent of quote/tape batching: a malformed or slow
+    // risk feed can only leave this panel empty, never stall other topics.
+    if (batch.riskSnapshot) setRiskSnapshot(batch.riskSnapshot)
+    if (batch.riskEvents.length > 0) appendRiskEvents(batch.riskEvents)
 
     if (batch.gaps > 0 || batch.lastSeq !== 0) {
       connectionStore.set((prev) => ({

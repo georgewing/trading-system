@@ -125,13 +125,13 @@ func TestParseExecutionReportLiquidityIsSideAware(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			raw := []byte(fmt.Sprintf(`{
+			raw := fmt.Appendf(nil, `{
 				"e":"executionReport","E":1700000000200,"s":"BTCUSDT","c":"1001",
 				"S":%q,"o":"LIMIT","f":"GTC","q":"2.00000000","p":"25000.00000000",
 				"x":"TRADE","X":"PARTIALLY_FILLED","r":"NONE","i":42,
 				"l":"0.50000000","z":"0.50000000","L":"24999.50000000",
 				"T":1700000000150,"t":77,"m":%t
-			}`, tt.side, tt.buyerIsMaker))
+			}`, tt.side, tt.buyerIsMaker)
 
 			report, err := ParseExecutionReport(raw, reportConfig())
 			if err != nil {
@@ -241,12 +241,12 @@ func TestParseExecutionReportOrderIDFallback(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			raw := []byte(fmt.Sprintf(`{
+			raw := fmt.Appendf(nil, `{
 				"e":"executionReport","E":1700000000200,"s":"BTCUSDT","c":%q,
 				"S":"BUY","o":"LIMIT","f":"GTC","q":"2.00000000","p":"25000.00000000",
 				"x":"NEW","X":"NEW","r":"NONE","i":42,
 				"l":"0","z":"0","L":"0","T":1700000000150,"t":-1,"m":false
-			}`, tt.clientOrderID))
+			}`, tt.clientOrderID)
 
 			report, err := ParseExecutionReport(raw, reportConfig())
 			if err != nil {
@@ -330,12 +330,12 @@ func TestParseExecutionReportRejectsUnsupportedValues(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			frame := fmt.Sprintf(`{
+			frame := `{
 				"e":"executionReport","E":1700000000200,"s":"BTCUSDT","c":"1001",
 				"S":"BUY","o":"LIMIT","f":"GTC","q":"2.00000000","p":"25000.00000000",
 				"x":"NEW","X":"NEW","r":"NONE","i":42,
 				"l":"0","z":"0","L":"0","T":1700000000150,"t":-1,"m":false
-			}`)
+			}`
 			frame = strings.Replace(frame, tt.spot, tt.value, 1)
 
 			if _, err := ParseExecutionReport([]byte(frame), reportConfig()); err == nil {

@@ -11,6 +11,7 @@ package engine
 import (
 	"context"
 	"errors"
+	"sort"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -102,6 +103,34 @@ func (m *Matcher) RestingOrderCount() int {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return len(m.activeOrders)
+}
+
+// OpenOrders returns the resting order ids for one account and symbol, ordered
+// by ascending order id, which is also creation order for engine-generated ids.
+// A non-empty strategy narrows the result to that strategy's orders, so two
+// strategies sharing an account cannot cancel or count each other's quotes.
+func (m *Matcher) OpenOrders(accountID uint64, strategy, symbol string) []uint64 {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	ids := make([]uint64, 0, len(m.activeOrders))
+	for id, order := range m.activeOrders {
+		if order.Leaves <= 0 {
+			continue
+		}
+		if order.AccountID != accountID {
+			continue
+		}
+		if strategy != "" && order.Strategy != strategy {
+			continue
+		}
+		if symbol != "" && order.Symbol != symbol {
+			continue
+		}
+		ids = append(ids, id)
+	}
+	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+	return ids
 }
 
 // Match executes the taker order against the opposite side and returns the
@@ -248,6 +277,7 @@ func execReportForMaker(maker *Order, trade Trade, price, fillQty int64) ExecRep
 		ClientOrderID: maker.ClientOrderID,
 		AccountID:     maker.AccountID,
 		Symbol:        maker.Symbol,
+		Strategy:      maker.Strategy,
 		Side:          maker.Side,
 		Status:        maker.Status,
 		Filled:        maker.Filled,
@@ -260,6 +290,8 @@ func execReportForMaker(maker *Order, trade Trade, price, fillQty int64) ExecRep
 		OrderType:     maker.Type,
 		TIF:           maker.TIF,
 		Quantity:      maker.Quantity,
+		ExecType:      ExecTypeTrade,
+		Liquidity:     LiquidityMaker,
 		Trade:         &tradeCopy,
 		Timestamp:     time.Now().UnixNano(),
 	}

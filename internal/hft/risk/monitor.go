@@ -84,15 +84,28 @@ type monitorState struct {
 	until   time.Time
 }
 
+// Subject identifies the party a breaker state belongs to. Strategy is
+// normalized with NormalizeStrategy, so untagged orders share DefaultStrategy.
+type Subject struct {
+	AccountID uint64
+	Strategy  string
+}
+
+func (s Subject) normalized() Subject {
+	s.Strategy = NormalizeStrategy(s.Strategy)
+	return s
+}
+
 // Monitor is the stateful intraday risk supervisor. One state exists per
-// (account, symbol) pair.
+// (account, strategy) pair, so a breach pauses only the strategy responsible
+// for it rather than every strategy on the account.
 type Monitor struct {
 	cfg IntradayConfig
 	pos *Positions
 	now func() time.Time
 
 	mu     sync.Mutex
-	states map[PositionKey]*monitorState
+	states map[Subject]*monitorState
 }
 
 // NewMonitor builds a monitor. positions may be nil, which disables the PnL
@@ -102,7 +115,7 @@ func NewMonitor(cfg IntradayConfig, positions *Positions) *Monitor {
 		cfg:    cfg,
 		pos:    positions,
 		now:    time.Now,
-		states: make(map[PositionKey]*monitorState),
+		states: make(map[Subject]*monitorState),
 	}
 }
 
@@ -115,7 +128,7 @@ func (m *Monitor) SetClock(now func() time.Time) {
 
 // Check evaluates the supervisor state before an order is accepted. It returns
 // the decision plus any state transitions the caller must publish.
-func (m *Monitor) Check(accountID uint64, symbol string, now time.Time) (Decision, []Trigger) {
+func (m *Monitor) Check(sub Subject, now time.Time) (Decision, []Trigger) {
 	if !m.cfg.Enabled() {
 		return Decision{Approved: true, Code: CodeOK}, nil
 	}
@@ -126,8 +139,7 @@ func (m *Monitor) Check(accountID uint64, symbol string, now time.Time) (Decisio
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	key := PositionKey{AccountID: accountID, Symbol: symbol}
-	st := m.stateLocked(key, now)
+	st := m.stateLocked(sub.normalized(), now)
 	var triggers []Trigger
 
 	switch st.action {
@@ -171,7 +183,7 @@ func (m *Monitor) Check(accountID uint64, symbol string, now time.Time) (Decisio
 }
 
 // Evaluate checks PnL-based limits. Call it after fills are applied.
-func (m *Monitor) Evaluate(accountID uint64, symbol string, now time.Time) []Trigger {
+func (m *Monitor) Evaluate(sub Subject, now time.Time) []Trigger {
 	if !m.cfg.Enabled() || m.pos == nil {
 		return nil
 	}
@@ -182,16 +194,17 @@ func (m *Monitor) Evaluate(accountID uint64, symbol string, now time.Time) []Tri
 		now = m.now()
 	}
 
+	sub = sub.normalized()
+
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	key := PositionKey{AccountID: accountID, Symbol: symbol}
-	st := m.stateLocked(key, now)
+	st := m.stateLocked(sub, now)
 	if st.action == ActionHalt {
 		return nil
 	}
 
-	equity := m.pos.AccountEquity(accountID)
+	equity := m.pos.StrategyEquity(sub.AccountID, sub.Strategy)
 	if equity > st.peakEquity {
 		st.peakEquity = equity
 	}
@@ -215,7 +228,7 @@ func (m *Monitor) Evaluate(accountID uint64, symbol string, now time.Time) []Tri
 
 // OnOrderAccepted records one accepted order for open-order and cancel-ratio
 // accounting.
-func (m *Monitor) OnOrderAccepted(accountID uint64, symbol string, now time.Time) {
+func (m *Monitor) OnOrderAccepted(sub Subject, now time.Time) {
 	if !m.cfg.Enabled() {
 		return
 	}
@@ -226,29 +239,29 @@ func (m *Monitor) OnOrderAccepted(accountID uint64, symbol string, now time.Time
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	st := m.stateLocked(PositionKey{AccountID: accountID, Symbol: symbol}, now)
+	st := m.stateLocked(sub.normalized(), now)
 	st.open++
 	st.orders++
 }
 
 // OnOrderClosed releases one open order. It is idempotent with respect to
 // underflow.
-func (m *Monitor) OnOrderClosed(accountID uint64, symbol string) {
+func (m *Monitor) OnOrderClosed(sub Subject) {
 	if !m.cfg.Enabled() {
 		return
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	st := m.stateLocked(PositionKey{AccountID: accountID, Symbol: symbol}, m.now())
+	st := m.stateLocked(sub.normalized(), m.now())
 	if st.open > 0 {
 		st.open--
 	}
 }
 
-// OnCancel records one cancellation. The cancel API is not wired into the
-// gateway yet, so this is called by tests and by the future cancel path.
-func (m *Monitor) OnCancel(accountID uint64, symbol string, now time.Time) {
+// OnCancel records one cancellation so the cancel ratio sees it. The gateway
+// cancel path calls it through risk.Engine.OnCancel.
+func (m *Monitor) OnCancel(sub Subject, now time.Time) {
 	if !m.cfg.Enabled() {
 		return
 	}
@@ -259,7 +272,7 @@ func (m *Monitor) OnCancel(accountID uint64, symbol string, now time.Time) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	st := m.stateLocked(PositionKey{AccountID: accountID, Symbol: symbol}, now)
+	st := m.stateLocked(sub.normalized(), now)
 	st.cancels++
 	if st.open > 0 {
 		st.open--
@@ -267,11 +280,11 @@ func (m *Monitor) OnCancel(accountID uint64, symbol string, now time.Time) {
 }
 
 // State returns the current action and its message.
-func (m *Monitor) State(accountID uint64, symbol string) (Action, string) {
+func (m *Monitor) State(sub Subject) (Action, string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	st := m.states[PositionKey{AccountID: accountID, Symbol: symbol}]
+	st := m.states[sub.normalized()]
 	if st == nil || st.action == "" {
 		return ActionAllow, ""
 	}
@@ -279,17 +292,17 @@ func (m *Monitor) State(accountID uint64, symbol string) (Action, string) {
 }
 
 // Reset clears a halt or pause. It is the manual override for operators.
-func (m *Monitor) Reset(accountID uint64, symbol string) {
+func (m *Monitor) Reset(sub Subject) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	delete(m.states, PositionKey{AccountID: accountID, Symbol: symbol})
+	delete(m.states, sub.normalized())
 }
 
-func (m *Monitor) stateLocked(key PositionKey, now time.Time) *monitorState {
-	st := m.states[key]
+func (m *Monitor) stateLocked(sub Subject, now time.Time) *monitorState {
+	st := m.states[sub]
 	if st == nil {
 		st = &monitorState{windowStart: now, action: ActionAllow}
-		m.states[key] = st
+		m.states[sub] = st
 	}
 	if m.cfg.CancelWindow > 0 && !st.windowStart.IsZero() && now.Sub(st.windowStart) >= m.cfg.CancelWindow {
 		st.windowStart = now

@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"runtime"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -46,6 +47,65 @@ func capture(r *http.Request) (capturedRequest, error) {
 		hasAuth:     ok,
 		body:        body,
 	}, nil
+}
+
+// requestLog records requests served by a test server. Handlers must never
+// block: a blocking channel send parks the handler goroutine as soon as the
+// client sends more requests than the test expects (for example an idempotent
+// GET replayed by the transport on a stale keep-alive connection).
+// httptest.Server.Close waits for active connections, so a parked handler
+// wedges the whole test binary instead of failing the test.
+type requestLog struct {
+	mu    sync.Mutex
+	reqs  []capturedRequest
+	ready chan struct{}
+}
+
+func newRequestLog() *requestLog {
+	return &requestLog{ready: make(chan struct{}, 1)}
+}
+
+// handle captures r and reports whether the caller should still respond.
+func (log *requestLog) handle(rw http.ResponseWriter, r *http.Request) bool {
+	c, err := capture(r)
+	if err != nil {
+		http.Error(rw, err.Error(), http.StatusBadRequest)
+		return false
+	}
+
+	log.mu.Lock()
+	log.reqs = append(log.reqs, c)
+	log.mu.Unlock()
+
+	select {
+	case log.ready <- struct{}{}:
+	default:
+	}
+	return true
+}
+
+// wait returns the recorded requests once at least n have arrived. It fails the
+// test on timeout so a missing request never hangs the run.
+func (log *requestLog) wait(t *testing.T, n int) []capturedRequest {
+	t.Helper()
+
+	timer := time.NewTimer(5 * time.Second)
+	defer timer.Stop()
+
+	for {
+		log.mu.Lock()
+		got := append([]capturedRequest(nil), log.reqs...)
+		log.mu.Unlock()
+		if len(got) >= n {
+			return got
+		}
+
+		select {
+		case <-log.ready:
+		case <-timer.C:
+			t.Fatalf("timed out waiting for %d request(s), got %d", n, len(got))
+		}
+	}
 }
 
 func TestNewWriterDefaults(t *testing.T) {
@@ -140,14 +200,11 @@ func TestNewWriterInvalid(t *testing.T) {
 }
 
 func TestPingSuccess(t *testing.T) {
-	reqs := make(chan capturedRequest, 1)
+	log := newRequestLog()
 	srv := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
-		c, err := capture(r)
-		if err != nil {
-			http.Error(rw, err.Error(), http.StatusBadRequest)
+		if !log.handle(rw, r) {
 			return
 		}
-		reqs <- c
 		_, _ = io.WriteString(rw, "Ok.\n")
 	}))
 	defer srv.Close()
@@ -160,7 +217,7 @@ func TestPingSuccess(t *testing.T) {
 		t.Fatalf("Ping() error = %v", err)
 	}
 
-	got := <-reqs
+	got := log.wait(t, 1)[0]
 	if got.method != http.MethodGet {
 		t.Errorf("method = %q, want %q", got.method, http.MethodGet)
 	}
@@ -197,14 +254,11 @@ func TestPingNon200(t *testing.T) {
 }
 
 func TestInsertTrades(t *testing.T) {
-	reqs := make(chan capturedRequest, 1)
+	log := newRequestLog()
 	srv := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
-		c, err := capture(r)
-		if err != nil {
-			http.Error(rw, err.Error(), http.StatusBadRequest)
+		if !log.handle(rw, r) {
 			return
 		}
-		reqs <- c
 		rw.WriteHeader(http.StatusOK)
 	}))
 	defer srv.Close()
@@ -240,7 +294,7 @@ func TestInsertTrades(t *testing.T) {
 		t.Fatalf("InsertTrades() error = %v", err)
 	}
 
-	got := <-reqs
+	got := log.wait(t, 1)[0]
 	if got.method != http.MethodPost {
 		t.Errorf("method = %q, want %q", got.method, http.MethodPost)
 	}
@@ -403,7 +457,13 @@ func TestInsertTradesTimeout(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			srv := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
 				_, _ = io.Copy(io.Discard, r.Body)
-				time.Sleep(200 * time.Millisecond)
+				// Return as soon as the client gives up so Close does not have to
+				// wait out the full delay on an active connection.
+				select {
+				case <-time.After(200 * time.Millisecond):
+				case <-r.Context().Done():
+					return
+				}
 				rw.WriteHeader(http.StatusOK)
 			}))
 			defer srv.Close()
@@ -459,14 +519,11 @@ func TestInsertTradesContextCanceled(t *testing.T) {
 }
 
 func TestBasePathPrefix(t *testing.T) {
-	reqs := make(chan capturedRequest, 2)
+	log := newRequestLog()
 	srv := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
-		c, err := capture(r)
-		if err != nil {
-			http.Error(rw, err.Error(), http.StatusBadRequest)
+		if !log.handle(rw, r) {
 			return
 		}
-		reqs <- c
 		rw.WriteHeader(http.StatusOK)
 	}))
 	defer srv.Close()
@@ -487,8 +544,8 @@ func TestBasePathPrefix(t *testing.T) {
 		t.Fatalf("InsertTrades() error = %v", err)
 	}
 
-	ping := <-reqs
-	insert := <-reqs
+	got := log.wait(t, 2)
+	ping, insert := got[0], got[1]
 	if want := "/clickhouse/ping"; ping.path != want {
 		t.Errorf("ping path = %q, want %q", ping.path, want)
 	}

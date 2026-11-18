@@ -23,6 +23,9 @@ type OrderRequest struct {
 	Price  int64
 	Qty    int64
 	Tag    string
+	// Strategy is filled by Runner with the strategy name. A live adapter maps
+	// it onto the engine order so risk breaks and metrics are strategy-scoped.
+	Strategy string
 }
 
 // Fill is one execution produced by a venue or the simulator.

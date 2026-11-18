@@ -2,6 +2,7 @@ import type {
   ApiError,
   OrderRow,
   OrdersResponse,
+  RiskEvent,
   SubmitOrderRequest,
   SubmitOrderResponse,
 } from './envelope'
@@ -39,6 +40,11 @@ export interface AccountSummary {
   wins: number
 }
 
+/** Recent risk decisions used to seed the risk panel. */
+export interface RiskEventsResponse {
+  events: RiskEvent[]
+}
+
 /** Read instrument metadata before opening the WebSocket. */
 export async function fetchMeta(): Promise<MetaResponse> {
   const res = await fetch('/api/v1/meta')
@@ -66,6 +72,18 @@ export async function cancelOrder(orderId: string, reason = 'user'): Promise<voi
     body: JSON.stringify({ order_id: orderId, reason }),
   })
   if (!res.ok) throw new Error(await readError(res))
+}
+
+/**
+ * Read recent risk decisions. The endpoint may not exist while the backend is
+ * under construction, so callers must treat failures as "no history yet".
+ */
+export async function fetchRiskEvents(limit = 50): Promise<RiskEvent[]> {
+  const res = await fetch(`/api/v1/risk/events?limit=${limit}`)
+  if (!res.ok) throw new Error(await readError(res))
+
+  const body = (await res.json()) as RiskEventsResponse
+  return body.events ?? []
 }
 
 /** Read the recent order page used to seed the order panel. */

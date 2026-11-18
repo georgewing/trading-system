@@ -8,8 +8,8 @@ import (
 	"sync"
 	"testing"
 
-	"trading-system/internal/hft/engine"
 	"trading-system/internal/execution"
+	"trading-system/internal/hft/engine"
 	"trading-system/internal/routing"
 )
 

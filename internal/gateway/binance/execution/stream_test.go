@@ -325,7 +325,8 @@ func TestRunUserStreamRejectsNilArguments(t *testing.T) {
 	if err := venue.RunUserStream(context.Background(), nil); !errors.Is(err, ErrNilReportChannel) {
 		t.Fatalf("RunUserStream(nil channel) error = %v, want ErrNilReportChannel", err)
 	}
-	if err := venue.RunUserStream(nil, make(chan engine.ExecReport)); err == nil {
+	var nilCtx context.Context
+	if err := venue.RunUserStream(nilCtx, make(chan engine.ExecReport)); err == nil {
 		t.Fatal("RunUserStream(nil ctx) error = nil, want an error")
 	}
 }

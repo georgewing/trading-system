@@ -15,6 +15,7 @@ import (
 	"trading-system/pkg/idgen"
 
 	"trading-system/internal/execution"
+	binanceexec "trading-system/internal/gateway/binance/execution"
 	"trading-system/internal/hft/domain"
 	"trading-system/internal/hft/engine"
 	"trading-system/internal/hft/infra/binance"
@@ -74,11 +75,53 @@ func Run(ctx context.Context, cfg *Config) error {
 	matcher := engine.NewMatcher(ob)
 
 	paper := execution.NewPaperVenue("paper", matcher)
+	venues := map[string]execution.Venue{"paper": paper}
+
+	var binanceVenue *binanceexec.Venue
+	if cfg.Execution.Binance.Enabled {
+		if cfg.Execution.Binance.AccountID == 0 {
+			_ = apiLn.Close()
+			_ = metricsLn.Close()
+			return errors.New("execution.binance.account_id is required when enabled")
+		}
+		venue, err := binanceexec.New(binanceexec.Config{
+			BaseURL:       cfg.Execution.Binance.BaseURL,
+			WSURL:         cfg.Execution.Binance.WSURL,
+			APIKey:        os.Getenv("BINANCE_API_KEY"),
+			APISecret:     os.Getenv("BINANCE_API_SECRET"),
+			AccountID:     cfg.Execution.Binance.AccountID,
+			RecvWindow:    time.Duration(cfg.Execution.Binance.RecvWindowSeconds) * time.Second,
+			PriceScale:    priceScale,
+			QuantityScale: quantityScale,
+			ReconnectMin:  time.Duration(cfg.Execution.Binance.ReconnectMinSeconds) * time.Second,
+			ReconnectMax:  time.Duration(cfg.Execution.Binance.ReconnectMaxSeconds) * time.Second,
+		})
+		if err != nil {
+			_ = apiLn.Close()
+			_ = metricsLn.Close()
+			return fmt.Errorf("binance execution venue: %w", err)
+		}
+
+		syncCtx, syncCancel := context.WithTimeout(ctx, 5*time.Second)
+		err = venue.SyncClock(syncCtx)
+		syncCancel()
+		if err != nil {
+			_ = apiLn.Close()
+			_ = metricsLn.Close()
+			return fmt.Errorf("binance execution clock sync: %w", err)
+		}
+
+		binanceVenue = venue
+		venues[venue.Name()] = &ackOnlyVenue{Venue: venue, quantityScale: quantityScale}
+		log.Printf("binance execution venue enabled: base=%s ws=%s account=%d",
+			cfg.Execution.Binance.BaseURL, cfg.Execution.Binance.WSURL, cfg.Execution.Binance.AccountID)
+	}
+
 	defaultVenue := cfg.Routing.DefaultVenue
 	if defaultVenue == "" {
 		defaultVenue = "paper"
 	}
-	router, err := routing.NewRouter(defaultVenue, map[string]execution.Venue{"paper": paper}, cfg.Routing.SymbolVenues)
+	router, err := routing.NewRouter(defaultVenue, venues, cfg.Routing.SymbolVenues)
 	if err != nil {
 		_ = apiLn.Close()
 		_ = metricsLn.Close()
@@ -105,10 +148,36 @@ func Run(ctx context.Context, cfg *Config) error {
 		return err
 	}
 
+	// The history route is always registered. Without ClickHouse it answers
+	// 503 instead of serving the short in-memory buffer as if it were history.
+	var klineHistory tradinghttp.KlineHistoryReader
+	if cfg.Storage.ClickHouseEnabled {
+		chReader, err := newCHKlineReader(cfg)
+		if err != nil {
+			closePGWriter(pgWriter)
+			_ = apiLn.Close()
+			_ = metricsLn.Close()
+			return fmt.Errorf("clickhouse kline reader: %w", err)
+		}
+		klineHistory = chReader
+	}
+
 	// The position ledger exists even when risk checks are disabled, so the
 	// portfolio endpoints always have a consistent (empty) answer instead of
 	// disappearing from the API surface.
 	positions := risk.NewPositions()
+	if cfg.Risk.Enabled && pgWriter != nil {
+		loadCtx, loadCancel := context.WithTimeout(ctx, 5*time.Second)
+		err := restorePositions(loadCtx, pgWriter, positions)
+		loadCancel()
+		if err != nil {
+			closePGWriter(pgWriter)
+			_ = apiLn.Close()
+			_ = metricsLn.Close()
+			return fmt.Errorf("restore positions: %w", err)
+		}
+		log.Printf("positions restored from postgres")
+	}
 
 	var riskHub *ws.RiskHub
 	var riskSink *risk.AsyncSink
@@ -135,7 +204,6 @@ func Run(ctx context.Context, cfg *Config) error {
 			return fmt.Errorf("risk.intraday.max_daily_loss: %w", err)
 		}
 
-		positions = risk.NewPositions()
 		riskHub = ws.NewRiskHub(cfg.WebSocket.BufferSize, 100)
 		riskSink = risk.NewAsyncSink(risk.MultiSink{risk.NewLogSink(), riskHub}, 1024, metrics)
 
@@ -178,6 +246,7 @@ func Run(ctx context.Context, cfg *Config) error {
 	}
 
 	pipelineCtx, pipelineCancel := context.WithCancel(context.Background())
+	externalCtx, externalCancel := context.WithCancel(context.Background())
 
 	if plane.source != nil {
 		emit := func(ev domain.Event) {
@@ -208,9 +277,41 @@ func Run(ctx context.Context, cfg *Config) error {
 
 	bus.Start(pipelineCtx)
 
+	book := orders.NewBook(10000)
+
+	var externalWG sync.WaitGroup
+	if binanceVenue != nil {
+		reports := make(chan engine.ExecReport, 1024)
+		externalWG.Add(2)
+		go func() {
+			defer externalWG.Done()
+			if err := binanceVenue.RunUserStream(externalCtx, reports); err != nil && externalCtx.Err() == nil {
+				log.Printf("binance user stream stopped: %v", err)
+			}
+		}()
+		go func() {
+			defer externalWG.Done()
+			for {
+				select {
+				case <-externalCtx.Done():
+					return
+				case report, ok := <-reports:
+					if !ok {
+						return
+					}
+					if rec, ok := book.Get(report.OrderID); ok && rec.ClientOrderID != "" {
+						report.ClientOrderID = rec.ClientOrderID
+					}
+					if err := bus.PublishReport(pipelineCtx, report); err != nil {
+						log.Printf("publish external report failed: orderID=%d err=%v", report.OrderID, err)
+					}
+				}
+			}
+		}()
+	}
+
 	wsHub := ws.NewHub(cfg.WebSocket.BufferSize)
 	wsHub.SetMetrics(metrics)
-	book := orders.NewBook(10000)
 
 	workerCfg := pipeline.DefaultOutboundWorkerConfig()
 	if persistenceEnabled {
@@ -268,6 +369,9 @@ func Run(ctx context.Context, cfg *Config) error {
 	apiMux.Handle("/api/v1/market/kline", tradinghttp.MakeKlineEndpoint(
 		snapshotter, cfg.Matcher.Symbol, cfg.Matcher.PricePrecision, cfg.Matcher.QuantityPrecision,
 	))
+	apiMux.Handle("/api/v1/market/kline/history", tradinghttp.MakeKlineHistoryEndpoint(
+		klineHistory, cfg.Matcher.Symbol, cfg.Matcher.PricePrecision, cfg.Matcher.QuantityPrecision,
+	))
 
 	wsServer := ws.NewServer(plane.stream(), snapshotter, wsHub, ws.ServerConfig{
 		Symbol:            cfg.Matcher.Symbol,
@@ -296,10 +400,25 @@ func Run(ctx context.Context, cfg *Config) error {
 	if err := bus.Drain(drainCtx); err != nil {
 		log.Printf("eventbus drain failed: %v", err)
 	}
-	if err := worker.Stop(drainCtx); err != nil {
+	drainCancel()
+
+	externalCancel()
+	externalDone := make(chan struct{})
+	go func() {
+		externalWG.Wait()
+		close(externalDone)
+	}()
+	select {
+	case <-externalDone:
+	case <-time.After(2 * time.Second):
+		log.Printf("external execution stream did not stop before timeout")
+	}
+
+	stopCtx, stopCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	if err := worker.Stop(stopCtx); err != nil {
 		log.Printf("outbound worker drain failed: %v", err)
 	}
-	drainCancel()
+	stopCancel()
 
 	pipelineCancel()
 
@@ -308,6 +427,14 @@ func Run(ctx context.Context, cfg *Config) error {
 		log.Printf("outbound worker wait failed: %v", err)
 	}
 	waitCancel()
+
+	if cfg.Risk.Enabled && pgWriter != nil {
+		saveCtx, saveCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		if err := persistPositions(saveCtx, pgWriter, positions); err != nil {
+			log.Printf("persist positions failed: %v", err)
+		}
+		saveCancel()
+	}
 
 	if pgWriter != nil {
 		if err := pgWriter.Close(); err != nil {

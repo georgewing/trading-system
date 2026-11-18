@@ -187,28 +187,34 @@ func MakeKlineEndpoint(snap domain.Snapshotter, defaultSymbol string, pricePreci
 		limit := queryLimit(r, defaultKlineLimit, maxKlineLimit)
 
 		klines := snap.Klines(symbol, interval, limit)
-		out := make([]klineResponse, 0, len(klines))
-		for _, k := range klines {
-			out = append(out, klineResponse{
-				Symbol:   symbol,
-				Interval: k.Interval,
-				OpenTime: k.OpenTime,
-				Open:     wire.Decimal(k.Open, pricePrecision),
-				High:     wire.Decimal(k.High, pricePrecision),
-				Low:      wire.Decimal(k.Low, pricePrecision),
-				Close:    wire.Decimal(k.Close, pricePrecision),
-				Volume:   wire.Decimal(k.Volume, qtyPrecision),
-				Closed:   k.Closed,
-				Ts:       k.OpenTime,
-			})
-		}
 
 		writeJSON(w, http.StatusOK, map[string]any{
 			"symbol":   symbol,
 			"interval": interval,
-			"klines":   out,
+			"klines":   klineResponses(klines, symbol, pricePrecision, qtyPrecision),
 		})
 	})
+}
+
+// klineResponses maps domain candles to the shared wire shape. Both the live
+// snapshot endpoint and the history endpoint use it so their JSON cannot drift.
+func klineResponses(klines []domain.Kline, symbol string, pricePrecision, qtyPrecision int) []klineResponse {
+	out := make([]klineResponse, 0, len(klines))
+	for _, k := range klines {
+		out = append(out, klineResponse{
+			Symbol:   symbol,
+			Interval: k.Interval,
+			OpenTime: k.OpenTime,
+			Open:     wire.Decimal(k.Open, pricePrecision),
+			High:     wire.Decimal(k.High, pricePrecision),
+			Low:      wire.Decimal(k.Low, pricePrecision),
+			Close:    wire.Decimal(k.Close, pricePrecision),
+			Volume:   wire.Decimal(k.Volume, qtyPrecision),
+			Closed:   k.Closed,
+			Ts:       k.OpenTime,
+		})
+	}
+	return out
 }
 
 // MakeOrdersEndpoint serves GET /api/v1/orders and GET /api/v1/orders/{id}.

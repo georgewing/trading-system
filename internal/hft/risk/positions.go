@@ -14,6 +14,26 @@ type PositionKey struct {
 	Symbol    string
 }
 
+// StrategyKey identifies one strategy's attribution inside an account. It is
+// used only for risk PnL scoping; the authoritative account position remains
+// keyed by account and symbol.
+type StrategyKey struct {
+	AccountID uint64
+	Strategy  string
+}
+
+// DefaultStrategy is the attribution used for untagged orders.
+const DefaultStrategy = "default"
+
+// NormalizeStrategy maps an empty strategy to DefaultStrategy, so callers never
+// have to branch on "legacy client" versus "strategy client".
+func NormalizeStrategy(strategy string) string {
+	if strategy == "" {
+		return DefaultStrategy
+	}
+	return strategy
+}
+
 // Position is a signed position with average cost. AvgCost is in price ticks,
 // Realized and Unrealized are in notional units (ticks * lots).
 type Position struct {
@@ -41,11 +61,19 @@ type Positions struct {
 	pos    map[PositionKey]Position
 	wins   int
 	closed int
+
+	// strategy attributes PnL to the strategy that submitted the order. It is
+	// in-memory only: the persisted snapshot stores account positions, so after a
+	// restart restored positions are attributed to DefaultStrategy.
+	strategy map[StrategyKey]map[string]Position
 }
 
 // NewPositions builds an empty ledger.
 func NewPositions() *Positions {
-	return &Positions{pos: make(map[PositionKey]Position)}
+	return &Positions{
+		pos:      make(map[PositionKey]Position),
+		strategy: make(map[StrategyKey]map[string]Position),
+	}
 }
 
 // Qty returns the signed position for one account and symbol.
@@ -90,6 +118,7 @@ func (p *Positions) Restore(entries map[PositionKey]Position) {
 	defer p.mu.Unlock()
 
 	p.pos = make(map[PositionKey]Position, len(entries))
+	p.strategy = make(map[StrategyKey]map[string]Position)
 	p.wins = 0
 	p.closed = 0
 
@@ -98,11 +127,26 @@ func (p *Positions) Restore(entries map[PositionKey]Position) {
 			continue
 		}
 		p.pos[key] = pos
+
+		sk := StrategyKey{AccountID: key.AccountID, Strategy: DefaultStrategy}
+		bySymbol := p.strategy[sk]
+		if bySymbol == nil {
+			bySymbol = make(map[string]Position)
+			p.strategy[sk] = bySymbol
+		}
+		bySymbol[key.Symbol] = pos
 	}
 }
 
-// ApplyFill books one fill. Quantity is always positive; side determines sign.
+// ApplyFill books one fill under DefaultStrategy. Quantity is always positive;
+// side determines sign.
 func (p *Positions) ApplyFill(accountID uint64, symbol string, side engine.Side, price, qty int64) {
+	p.ApplyFillFor(accountID, DefaultStrategy, symbol, side, price, qty)
+}
+
+// ApplyFillFor books one fill for both the account position and the strategy
+// attribution. Quantity is always positive; side determines sign.
+func (p *Positions) ApplyFillFor(accountID uint64, strategy, symbol string, side engine.Side, price, qty int64) {
 	if accountID == 0 || symbol == "" || qty <= 0 || price <= 0 {
 		return
 	}
@@ -110,12 +154,33 @@ func (p *Positions) ApplyFill(accountID uint64, symbol string, side engine.Side,
 	if side == engine.SideSell {
 		delta = -qty
 	}
+	strategy = NormalizeStrategy(strategy)
 
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
 	key := PositionKey{AccountID: accountID, Symbol: symbol}
-	pos := p.pos[key]
+	pos, closed, win := applyFillTo(p.pos[key], delta, price)
+	p.pos[key] = pos
+	if closed {
+		p.closed++
+		if win {
+			p.wins++
+		}
+	}
+
+	sk := StrategyKey{AccountID: accountID, Strategy: strategy}
+	bySymbol := p.strategy[sk]
+	if bySymbol == nil {
+		bySymbol = make(map[string]Position)
+		p.strategy[sk] = bySymbol
+	}
+	bySymbol[symbol], _, _ = applyFillTo(bySymbol[symbol], delta, price)
+}
+
+// applyFillTo updates one position with a signed delta and returns the new
+// position plus whether the fill closed quantity and whether it was profitable.
+func applyFillTo(pos Position, delta, price int64) (Position, bool, bool) {
 	pos.Mark = price
 
 	oldQty := pos.Qty
@@ -132,6 +197,7 @@ func (p *Positions) ApplyFill(accountID uint64, symbol string, side engine.Side,
 			pos.AvgCost = cost / absNew
 		}
 		pos.Qty = newQty
+		return pos, false, false
 
 	default:
 		closing := satAbs(oldQty)
@@ -145,10 +211,6 @@ func (p *Positions) ApplyFill(accountID uint64, symbol string, side engine.Side,
 			pnl = satMul(satSub(pos.AvgCost, price), closing)
 		}
 		pos.Realized = satAdd(pos.Realized, pnl)
-		p.closed++
-		if pnl > 0 {
-			p.wins++
-		}
 
 		newQty := satAdd(oldQty, delta)
 		switch {
@@ -158,9 +220,8 @@ func (p *Positions) ApplyFill(accountID uint64, symbol string, side engine.Side,
 			pos.AvgCost = price
 		}
 		pos.Qty = newQty
+		return pos, true, pnl > 0
 	}
-
-	p.pos[key] = pos
 }
 
 // Mark records the latest price for a symbol across all accounts. It is used to
@@ -178,6 +239,14 @@ func (p *Positions) Mark(symbol string, price int64) {
 		pos.Mark = price
 		p.pos[key] = pos
 	}
+	for _, bySymbol := range p.strategy {
+		pos, ok := bySymbol[symbol]
+		if !ok {
+			continue
+		}
+		pos.Mark = price
+		bySymbol[symbol] = pos
+	}
 }
 
 // AccountEquity returns realized plus unrealized PnL for one account.
@@ -190,6 +259,22 @@ func (p *Positions) AccountEquity(accountID uint64) int64 {
 		if key.AccountID != accountID {
 			continue
 		}
+		equity = satAdd(equity, pos.Realized)
+		equity = satAdd(equity, pos.Unrealized())
+	}
+	return equity
+}
+
+// StrategyEquity returns realized plus unrealized PnL attributed to one
+// strategy inside an account. The intraday loss and drawdown checks use it so a
+// breach pauses only the strategy that caused it.
+func (p *Positions) StrategyEquity(accountID uint64, strategy string) int64 {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+
+	sk := StrategyKey{AccountID: accountID, Strategy: NormalizeStrategy(strategy)}
+	var equity int64
+	for _, pos := range p.strategy[sk] {
 		equity = satAdd(equity, pos.Realized)
 		equity = satAdd(equity, pos.Unrealized())
 	}

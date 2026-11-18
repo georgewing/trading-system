@@ -3,13 +3,16 @@ import type {
   ExecReport,
   KlineData,
   OrderRow,
+  RiskEvent,
   TradeData,
 } from '../api/envelope'
+import { riskEventKey } from '../lib/risk'
 import { createStore } from './createStore'
 
 export const MAX_TRADES = 60
 export const MAX_KLINES = 500
 export const MAX_ORDERS = 200
+export const MAX_RISK_EVENTS = 200
 
 export interface MetaState {
   symbol: string
@@ -56,6 +59,86 @@ export const ordersStore = createStore<OrderRow[]>([])
  * cancel could have moved their numbers, instead of polling.
  */
 export const execTickStore = createStore<number>(0)
+
+/** Risk decision history, newest first. */
+export interface RiskState {
+  events: RiskEvent[]
+}
+
+export const riskEventStore = createStore<RiskState>({ events: [] })
+
+/**
+ * riskTick increments whenever the risk list actually changes, so consumers
+ * that only need "did anything happen" avoid diffing the event array.
+ */
+export const riskTickStore = createStore<number>(0)
+
+function bumpRiskTick(): void {
+  riskTickStore.set((n) => n + 1)
+}
+
+/** Newest first, de-duplicated, capped. Shared by snapshot and live paths. */
+function capRiskEvents(events: RiskEvent[]): RiskEvent[] {
+  const seen = new Set<string>()
+  const out: RiskEvent[] = []
+
+  // Stable sort keeps arrival order for decisions that share a millisecond.
+  for (const event of [...events].sort((a, b) => b.ts - a.ts)) {
+    const key = riskEventKey(event)
+    if (seen.has(key)) continue
+    seen.add(key)
+    out.push(event)
+    if (out.length >= MAX_RISK_EVENTS) break
+  }
+  return out
+}
+
+function sameRiskEvents(a: RiskEvent[], b: RiskEvent[]): boolean {
+  if (a.length !== b.length) return false
+  for (let i = 0; i < a.length; i += 1) {
+    if (riskEventKey(a[i]) !== riskEventKey(b[i])) return false
+    // An id-keyed replay may carry newer content for the same decision, so the
+    // key alone is not enough to call the state unchanged.
+    if (!sameRiskEvent(a[i], b[i])) return false
+  }
+  return true
+}
+
+function sameRiskEvent(a: RiskEvent, b: RiskEvent): boolean {
+  return (
+    a.id === b.id &&
+    a.ts === b.ts &&
+    a.account_id === b.account_id &&
+    a.symbol === b.symbol &&
+    a.strategy === b.strategy &&
+    a.order_id === b.order_id &&
+    a.code === b.code &&
+    a.action === b.action &&
+    a.message === b.message
+  )
+}
+
+/** Replace the list with a server snapshot. */
+export function setRiskSnapshot(events: RiskEvent[]): void {
+  const next = capRiskEvents(events)
+  if (sameRiskEvents(riskEventStore.get().events, next)) return
+
+  riskEventStore.set({ events: next })
+  bumpRiskTick()
+}
+
+/** Prepend live decisions, de-duplicating and capping the history. */
+export function appendRiskEvents(incoming: RiskEvent[]): void {
+  if (incoming.length === 0) return
+
+  const prev = riskEventStore.get().events
+  // Incoming goes first so it wins over a replayed copy of the same decision.
+  const next = capRiskEvents([...incoming, ...prev])
+  if (sameRiskEvents(prev, next)) return
+
+  riskEventStore.set({ events: next })
+  bumpRiskTick()
+}
 
 export function setDepth(depth: DepthData): void {
   depthStore.set(depth)

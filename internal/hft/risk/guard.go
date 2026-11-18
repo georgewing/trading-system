@@ -29,6 +29,7 @@ const (
 // integer units understood by the engine.
 type Request struct {
 	AccountID       uint64
+	Strategy        string // Optional; empty is normalized to "default".
 	ClientOrderID   string
 	Symbol          string
 	Side            engine.Side

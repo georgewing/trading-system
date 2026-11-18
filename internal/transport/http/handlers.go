@@ -20,6 +20,7 @@ type MatchRequest struct {
 	OrderID string `json:"order_id" validate:"required"`
 	// AccountID / Symbol 可选：risk 未开启时可省略，Symbol 为空时回退到端点默认交易对。
 	AccountID   uint64  `json:"account_id"`
+	Strategy    string  `json:"strategy"`
 	Symbol      string  `json:"symbol"`
 	Side        string  `json:"side" validate:"required,oneof=BUY SELL"`
 	Price       float64 `json:"price" validate:"required,gt=0"`
@@ -183,6 +184,7 @@ func newOrderFromRequest(req MatchRequest, defaultSymbol string, orderID uint64)
 		ID:            orderID,
 		ClientOrderID: req.OrderID,
 		AccountID:     req.AccountID,
+		Strategy:      req.Strategy,
 		Symbol:        symbol,
 		Side:          side,
 		Type:          engine.OrderType(req.Type),

@@ -65,6 +65,10 @@ type Order struct {
 	ClientOrderID string // 客户侧ID（可选）
 	AccountID     uint64
 	Symbol        string
+	// Strategy tags the order so risk breaks and metrics can be scoped to one
+	// strategy. Manual orders and legacy clients leave it empty; consumers
+	// normalize an empty value to "default".
+	Strategy string
 
 	// 订单核心属性
 	Side     Side
@@ -144,6 +148,9 @@ type ExecReport struct {
 	AccountID     uint64
 	Symbol        string
 	Side          Side
+	// Strategy echoes the order's strategy tag so persistence and risk can
+	// attribute the report without another lookup.
+	Strategy string
 
 	ExecType  ExecType
 	Status    OrderStatus
@@ -166,4 +173,9 @@ type ExecReport struct {
 	Reason    string
 	Venue     string
 	Timestamp int64
+
+	// MakerReported marks a taker report whose maker legs are published as
+	// separate reports. Risk accounting uses it to avoid booking the maker leg
+	// twice.
+	MakerReported bool
 }

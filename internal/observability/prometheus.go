@@ -41,6 +41,8 @@ type PrometheusMetrics struct {
 	riskEvents        *prometheus.CounterVec
 	riskEventDropped  prometheus.Counter
 	strategyState     *prometheus.GaugeVec
+	strategyOrders    *prometheus.CounterVec
+	strategyPanics    *prometheus.CounterVec
 
 	stateMu     sync.Mutex
 	stateLabels map[string]string
@@ -155,6 +157,24 @@ func NewPrometheusMetrics(cfg PrometheusConfig) (*PrometheusMetrics, error) {
 			},
 			[]string{"strategy", "state"},
 		),
+		strategyOrders: prometheus.NewCounterVec(
+			prometheus.CounterOpts{
+				Namespace: cfg.Namespace,
+				Subsystem: cfg.Subsystem,
+				Name:      "strategy_orders_total",
+				Help:      "Total number of strategy order submissions by result.",
+			},
+			[]string{"strategy", "result"},
+		),
+		strategyPanics: prometheus.NewCounterVec(
+			prometheus.CounterOpts{
+				Namespace: cfg.Namespace,
+				Subsystem: cfg.Subsystem,
+				Name:      "strategy_panics_total",
+				Help:      "Total number of isolated strategy panics.",
+			},
+			[]string{"strategy"},
+		),
 		feedMessages: prometheus.NewCounterVec(
 			prometheus.CounterOpts{
 				Namespace: cfg.Namespace,
@@ -221,6 +241,12 @@ func NewPrometheusMetrics(cfg PrometheusConfig) (*PrometheusMetrics, error) {
 		return nil, err
 	}
 	if err := registry.Register(m.strategyState); err != nil {
+		return nil, err
+	}
+	if err := registry.Register(m.strategyOrders); err != nil {
+		return nil, err
+	}
+	if err := registry.Register(m.strategyPanics); err != nil {
 		return nil, err
 	}
 	if err := registry.Register(m.feedMessages); err != nil {
@@ -328,6 +354,31 @@ func (m *PrometheusMetrics) IncRiskEventDrop() {
 		return
 	}
 	m.riskEventDropped.Inc()
+}
+
+// IncStrategyOrder records one strategy submission attempt.
+func (m *PrometheusMetrics) IncStrategyOrder(strategy, result string) {
+	if m == nil {
+		return
+	}
+	if strategy == "" {
+		strategy = "default"
+	}
+	if result == "" {
+		result = "unknown"
+	}
+	m.strategyOrders.WithLabelValues(strategy, result).Inc()
+}
+
+// IncStrategyPanic records one isolated strategy panic.
+func (m *PrometheusMetrics) IncStrategyPanic(strategy string) {
+	if m == nil {
+		return
+	}
+	if strategy == "" {
+		strategy = "default"
+	}
+	m.strategyPanics.WithLabelValues(strategy).Inc()
 }
 
 // SetStrategyState sets the state gauge for a strategy and clears its previous

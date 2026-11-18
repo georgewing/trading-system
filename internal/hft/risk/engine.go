@@ -97,6 +97,7 @@ func (e *Engine) Check(ctx context.Context, req Request) Decision {
 		now = e.clock()
 	}
 	req.Now = now
+	req.Strategy = NormalizeStrategy(req.Strategy)
 
 	if e.positions != nil {
 		req.CurrentPosition = e.positions.Qty(req.AccountID, req.Symbol)
@@ -112,9 +113,10 @@ func (e *Engine) Check(ctx context.Context, req Request) Decision {
 		return decision
 	}
 
-	decision, triggers := e.monitor.Check(req.AccountID, req.Symbol, now)
+	sub := Subject{AccountID: req.AccountID, Strategy: req.Strategy}
+	decision, triggers := e.monitor.Check(sub, now)
 	for _, t := range triggers {
-		e.emitTrigger(req.AccountID, req.Symbol, "", t, now)
+		e.emitTrigger(req.AccountID, req.Symbol, req.Strategy, t, now)
 	}
 	if !decision.Approved {
 		e.emitReject(req, decision, now)
@@ -125,42 +127,49 @@ func (e *Engine) Check(ctx context.Context, req Request) Decision {
 // OnOrderAccepted records an accepted order so open-order and cancel-ratio
 // accounting sees it.
 func (e *Engine) OnOrderAccepted(order engine.Order) {
-	e.monitor.OnOrderAccepted(order.AccountID, order.Symbol, e.clock())
+	e.monitor.OnOrderAccepted(subjectFor(order), e.clock())
 }
 
 // OnExecReport applies a fill to the position ledger and re-evaluates PnL-based
 // limits. Terminal reports release the order's open-order slot.
 func (e *Engine) OnExecReport(order engine.Order, report engine.ExecReport) {
 	now := e.clock()
+	strategy := NormalizeStrategy(order.Strategy)
 
 	if trade := report.Trade; trade != nil && trade.Quantity > 0 {
-		e.positions.ApplyFill(order.AccountID, order.Symbol, order.Side,
+		e.positions.ApplyFillFor(order.AccountID, strategy, order.Symbol, order.Side,
 			trade.Price, trade.Quantity)
 
-		// Internal fills also carry the resting side, so the maker's ledger must
-		// change too. A self-trade is already booked by the taker fill above;
-		// applying the maker leg as well would count the quantity twice.
-		if trade.MakerAccountID != 0 && trade.MakerAccountID != order.AccountID &&
-			validSide(trade.MakerSide) {
-			e.positions.ApplyFill(trade.MakerAccountID, order.Symbol, trade.MakerSide,
+		// Venues that report both sides in one message need the maker leg booked
+		// here. The paper matcher publishes maker reports separately, so skip the
+		// leg in that case to avoid counting the quantity twice. The maker's
+		// strategy is unknown for a combined venue report, so it falls back to
+		// DefaultStrategy.
+		if !report.MakerReported && trade.MakerAccountID != 0 &&
+			trade.MakerAccountID != order.AccountID && validSide(trade.MakerSide) {
+			e.positions.ApplyFillFor(trade.MakerAccountID, DefaultStrategy, order.Symbol, trade.MakerSide,
 				trade.Price, trade.Quantity)
 		}
 	}
 
+	sub := subjectFor(order)
 	switch report.Status {
 	case engine.OrderStatusFilled, engine.OrderStatusCanceled, engine.OrderStatusRejected:
-		e.monitor.OnOrderClosed(order.AccountID, order.Symbol)
+		e.monitor.OnOrderClosed(sub)
 	}
 
-	for _, t := range e.monitor.Evaluate(order.AccountID, order.Symbol, now) {
-		e.emitTrigger(order.AccountID, order.Symbol, "", t, now)
+	for _, t := range e.monitor.Evaluate(sub, now) {
+		e.emitTrigger(order.AccountID, order.Symbol, strategy, t, now)
 	}
 }
 
-// OnCancel records a cancellation. The cancel API is not wired to the gateway
-// this phase, so this method exists for the future path and for tests.
+// OnCancel records a cancellation so the cancel-ratio breaker sees it.
 func (e *Engine) OnCancel(order engine.Order) {
-	e.monitor.OnCancel(order.AccountID, order.Symbol, e.clock())
+	e.monitor.OnCancel(subjectFor(order), e.clock())
+}
+
+func subjectFor(order engine.Order) Subject {
+	return Subject{AccountID: order.AccountID, Strategy: NormalizeStrategy(order.Strategy)}
 }
 
 // Positions exposes the ledger for query endpoints and tests.
@@ -177,6 +186,7 @@ func (e *Engine) emitReject(req Request, decision Decision, now time.Time) {
 		TS:        now.UnixMilli(),
 		AccountID: req.AccountID,
 		Symbol:    req.Symbol,
+		Strategy:  req.Strategy,
 		Code:      decision.Code,
 		Action:    ActionReject,
 		Message:   decision.Message,
