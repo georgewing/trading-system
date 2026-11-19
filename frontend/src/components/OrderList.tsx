@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { cancelOrder, fetchOrders } from '../api/http'
+import { cancelOrder, cancelOrders, fetchOrders } from '../api/http'
 import type { OrderStatus } from '../api/envelope'
 import { formatClock, formatQty, scaledToDecimal, ticksToPrice } from '../lib/format'
 import { useStore } from '../store/createStore'
@@ -19,6 +19,13 @@ export function OrderList() {
   const meta = useStore(metaStore)
   const [error, setError] = useState<string | null>(null)
   const [canceling, setCanceling] = useState<string | null>(null)
+  const [batchBusy, setBatchBusy] = useState(false)
+  const [batchNote, setBatchNote] = useState<string | null>(null)
+
+  // Cancels only apply to orders that still have leaves on the book.
+  const openOrders = orders.filter(
+    (order) => order.status === 'NEW' || order.status === 'PARTIALLY_FILLED',
+  )
 
   useEffect(() => {
     let cancelled = false
@@ -41,6 +48,7 @@ export function OrderList() {
   async function handleCancel(orderId: string) {
     setCanceling(orderId)
     setError(null)
+    setBatchNote(null)
     try {
       await cancelOrder(orderId)
     } catch (err) {
@@ -50,14 +58,44 @@ export function OrderList() {
     }
   }
 
+  async function handleCancelOpen() {
+    if (openOrders.length === 0) return
+
+    setBatchBusy(true)
+    setError(null)
+    setBatchNote(null)
+    try {
+      const result = await cancelOrders(openOrders.map((order) => order.order_id))
+      // The matcher owns the resulting status, so re-read the order page instead
+      // of guessing it locally; live exec reports may land first.
+      mergeOrders(await fetchOrders())
+      setBatchNote(
+        `canceled ${result.canceled.length}, failed ${result.failed.length}`,
+      )
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'batch cancel failed')
+    } finally {
+      setBatchBusy(false)
+    }
+  }
+
   return (
     <section className="panel panel-orders">
       <div className="panel-head">
         <h2>Orders</h2>
         <span className="muted">{orders.length}</span>
+        <button
+          type="button"
+          className="cancel-btn"
+          disabled={openOrders.length === 0 || batchBusy}
+          onClick={() => void handleCancelOpen()}
+        >
+          {batchBusy ? '…' : `Cancel open (${openOrders.length})`}
+        </button>
       </div>
 
       {error && <div className="empty err">{error}</div>}
+      {batchNote && !error && <div className="empty">{batchNote}</div>}
 
       <div className="orders">
         <div className="orders-labels">

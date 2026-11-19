@@ -21,6 +21,7 @@ import (
 	"trading-system/internal/hft/infra/binance"
 	"trading-system/internal/hft/infra/memstore"
 	"trading-system/internal/hft/infra/orders"
+	"trading-system/internal/hft/live"
 	"trading-system/internal/hft/risk"
 	"trading-system/internal/observability"
 	"trading-system/internal/pipeline"
@@ -205,7 +206,11 @@ func Run(ctx context.Context, cfg *Config) error {
 		}
 
 		riskHub = ws.NewRiskHub(cfg.WebSocket.BufferSize, 100)
-		riskSink = risk.NewAsyncSink(risk.MultiSink{risk.NewLogSink(), riskHub}, 1024, metrics)
+		riskSinks := risk.MultiSink{risk.NewLogSink(), riskHub}
+		if pgWriter != nil {
+			riskSinks = append(riskSinks, newPGRiskSink(pgWriter))
+		}
+		riskSink = risk.NewAsyncSink(riskSinks, 1024, metrics)
 
 		intraday := cfg.Risk.Intraday
 		riskEngine := risk.NewEngine(risk.EngineConfig{
@@ -246,7 +251,11 @@ func Run(ctx context.Context, cfg *Config) error {
 	}
 
 	pipelineCtx, pipelineCancel := context.WithCancel(context.Background())
-	externalCtx, externalCancel := context.WithCancel(context.Background())
+
+	if cfg.Risk.Enabled && pgWriter != nil {
+		go positionSnapshotLoop(pipelineCtx, pgWriter, positions,
+			time.Duration(cfg.Storage.PositionSnapshotSeconds)*time.Second)
+	}
 
 	if plane.source != nil {
 		emit := func(ev domain.Event) {
@@ -277,7 +286,32 @@ func Run(ctx context.Context, cfg *Config) error {
 
 	bus.Start(pipelineCtx)
 
+	liveRunner, err := startLiveStrategy(pipelineCtx, cfg, live.Deps{
+		Bus:               bus,
+		Matcher:           matcher,
+		Positions:         positions,
+		Stream:            plane.stream(),
+		Snapshot:          plane.snapshotter(),
+		Metrics:           metrics,
+		QuantityPrecision: cfg.Matcher.QuantityPrecision,
+	})
+	if err != nil {
+		pipelineCancel()
+		bus.StopAccepting()
+		if riskSink != nil {
+			closeCtx, closeCancel := context.WithTimeout(context.Background(), time.Second)
+			_ = riskSink.Close(closeCtx)
+			closeCancel()
+		}
+		closePGWriter(pgWriter)
+		_ = apiLn.Close()
+		_ = metricsLn.Close()
+		return err
+	}
+
 	book := orders.NewBook(10000)
+
+	externalCtx, externalCancel := context.WithCancel(context.Background())
 
 	var externalWG sync.WaitGroup
 	if binanceVenue != nil {
@@ -358,6 +392,8 @@ func Run(ctx context.Context, cfg *Config) error {
 		positions, cfg.Risk.Enabled, cfg.Matcher.PricePrecision, cfg.Matcher.QuantityPrecision,
 	))
 	apiMux.Handle("/api/v1/order/cancel", tradinghttp.MakeCancelEndpoint(bus))
+	apiMux.Handle("/api/v1/order/cancel/batch", tradinghttp.MakeBatchCancelEndpoint(bus))
+	apiMux.Handle("/api/v1/risk/events", tradinghttp.MakeRiskEventsEndpoint(riskEventLister(pgWriter)))
 
 	snapshotter := plane.snapshotter()
 	apiMux.Handle("/api/v1/market/depth", tradinghttp.MakeDepthEndpoint(
@@ -393,6 +429,10 @@ func Run(ctx context.Context, cfg *Config) error {
 	log.Println("pipeline started: inbound matcher + outbound worker (ws/storage)")
 
 	runErr := serveServers(ctx, apiSrv, metricsSrv, apiLn, metricsLn)
+
+	if liveRunner != nil {
+		liveRunner.Stop()
+	}
 
 	bus.StopAccepting()
 

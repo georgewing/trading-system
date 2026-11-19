@@ -64,6 +64,23 @@ export async function fetchAccount(accountId = 0): Promise<AccountSummary> {
   return (await res.json()) as AccountSummary
 }
 
+/** Result of one order inside a batch cancel. */
+export interface BatchCanceledOrder {
+  order_id: string
+  filled: number
+}
+
+/** Per-order failure; the batch itself still answered 200. */
+export interface BatchCancelFailedOrder {
+  order_id: string
+  error: string
+}
+
+export interface BatchCancelResponse {
+  canceled: BatchCanceledOrder[]
+  failed: BatchCancelFailedOrder[]
+}
+
 /** Cancel a resting order. */
 export async function cancelOrder(orderId: string, reason = 'user'): Promise<void> {
   const res = await fetch('/api/v1/order/cancel', {
@@ -72,6 +89,25 @@ export async function cancelOrder(orderId: string, reason = 'user'): Promise<voi
     body: JSON.stringify({ order_id: orderId, reason }),
   })
   if (!res.ok) throw new Error(await readError(res))
+}
+
+/**
+ * Cancel several orders at once. Partial success is a 200: inspect `failed`
+ * rather than assuming every order in the batch was canceled.
+ */
+export async function cancelOrders(
+  orderIds: string[],
+  reason = 'batch',
+): Promise<BatchCancelResponse> {
+  const res = await fetch('/api/v1/order/cancel/batch', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ order_ids: orderIds, reason }),
+  })
+  if (!res.ok) throw new Error(await readError(res))
+
+  const body = (await res.json()) as Partial<BatchCancelResponse>
+  return { canceled: body.canceled ?? [], failed: body.failed ?? [] }
 }
 
 /**

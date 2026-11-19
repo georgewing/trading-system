@@ -61,6 +61,7 @@ type StorageConfig struct {
 	ClickHouseDatabase       string `yaml:"clickhouse_database"`
 	ClickHouseTable          string `yaml:"clickhouse_table"`
 	ClickHouseTimeoutSeconds int    `yaml:"clickhouse_timeout_seconds"`
+	PositionSnapshotSeconds  int    `yaml:"position_snapshot_seconds"`
 }
 type WebSocketConfig struct {
 	BufferSize int `yaml:"buffer_size"`

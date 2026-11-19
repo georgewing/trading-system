@@ -40,11 +40,29 @@ go run ./scripts/dev/feedcheck                # feed only, no server
 ```
 GET  /api/v1/meta                          instrument + precision
 GET  /api/v1/market/depth?symbol=&limit=
-GET  /api/v1/market/kline?symbol=&interval=&limit=
+GET  /api/v1/market/kline?symbol=&interval=&limit=          live buffer
+GET  /api/v1/market/kline/history?symbol=&from=&to=&limit=   ClickHouse, unix ms
 GET  /api/v1/market/trades?symbol=&limit=
+GET  /api/v1/positions?account_id=
+GET  /api/v1/account?account_id=
 GET  /api/v1/orders?limit=
 GET  /api/v1/orders/{order_id}
 POST /api/v1/order
+POST /api/v1/order/cancel
+POST /api/v1/order/cancel/batch
+```
+
+`/api/v1/market/kline/history` returns the same JSON shape as the live endpoint
+and answers `503` when ClickHouse is disabled or the query fails; it never falls
+back to the in-memory buffer, so the terminal cannot mistake stale data for
+history. Only `interval=1m` is supported.
+
+`POST /api/v1/order/cancel/batch` accepts up to 100 ids and reports per-order
+outcomes; a partial failure still returns `200`, because cancels that already
+reached the matcher cannot be rolled back:
+
+```json
+{"canceled":[{"order_id":"123","filled":0}],"failed":[{"order_id":"456","error":"order not found"}]}
 ```
 
 `POST /api/v1/order` keeps the existing contract: `price` is integer ticks
@@ -105,20 +123,19 @@ Types: `system.hello`, `system.pong`, `system.error`, `market.depth`,
 
 ## Known gaps
 
-1. **Execution is internal.** Orders match against the in-process paper book,
-   not Binance. Depth and candles are real; fills are simulated. Live execution
-   needs an authenticated venue adapter and is out of scope for this phase.
-2. **No cancel.** The matcher has no `Cancel`; `execution.PaperVenue.Cancel`
-   returns `ErrCancelNotSupported`, and there is no cancel endpoint.
-3. **No positions/accounts.** `risk.Request.CurrentPosition` is never populated,
-   so `max_position` degrades to a per-order quantity cap and the UI has no
-   position panel.
-4. **Single node.** `ws.Hub` and the market store are process-local. The k8s
-   manifest asks for 10 replicas, which would need sticky sessions or a shared
-   bus.
-5. **Depth is a snapshot stream.** Binance's `depth20@100ms` already sends full
-   top-20 snapshots, so no delta reconstruction is needed. A true incremental
-   feed would need sequence-based book maintenance.
+1. **Execution is internal.** Orders match against the in-process paper book
+   unless a live venue is configured. Depth and candles are real; paper fills
+   are simulated.
+2. **Single node.** `ws.Hub`, the market store and the position ledger are
+   process-local. The k8s manifest asks for 10 replicas, which would need
+   sticky sessions or a shared bus.
+3. **Depth is a snapshot stream.** Binance's `depth20@100ms` already sends full
+   top-20 snapshots, so no delta reconstruction is needed.
+4. **Historical klines need ClickHouse.** The materialized view only covers
+   ticks written after it was created; existing ticks are not backfilled.
+5. **Precision matters for notional math.** `price_precision + quantity_precision`
+   at 8 + 8 overflows int64 when multiplying ticks by lots. Keep the sum small
+   (the risk E2E config uses 2 + 6).
 
 ## Architecture: ports and adapters
 

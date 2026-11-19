@@ -26,6 +26,25 @@ pipeline:
   inbound_capacity: 1048576
   outbound_capacity: 1048576
 
+# Optional live strategy. Only single-symbol strategies run live today
+# (market_maker, noop). Requires risk.enabled and market.enabled: the strategy
+# consumes the live book and its orders are risk-checked and attributed by name.
+strategy:
+  enabled: false
+  name: "market_maker"
+  account_id: 1
+  symbol: ""                # empty falls back to matcher.symbol
+  timer_seconds: 5
+  submit_timeout_millis: 2000
+  max_order_rate: 20          # accepted orders per second, 0 = unlimited
+  max_open_orders: 4          # resting orders per strategy
+  max_panics: 3
+  params:
+    half_spread_bps: "5"
+    order_qty: "10000000"     # lots, already scaled by quantity_precision
+    inventory_limit: "0"      # absolute position cap in lots, 0 = unlimited
+    min_requote_bps: "1"
+
 # Order routing between execution venues. "paper" is always available;
 # "binance" exists when execution.binance.enabled is true. An empty
 # default_venue falls back to "paper".
@@ -85,6 +104,7 @@ storage:
   clickhouse_database: "market"
   clickhouse_table: "trade_ticks"
   clickhouse_timeout_seconds: 5
+  position_snapshot_seconds: 5
 
 websocket:
   buffer_size: 1024

@@ -7,6 +7,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"strconv"
 	"strings"
@@ -175,14 +176,8 @@ func MakeCancelEndpoint(requester CancelRequester) http.Handler {
 
 		report, err := requester.CancelOrder(r.Context(), orderID, req.Reason)
 		if err != nil {
-			switch {
-			case errors.Is(err, engine.ErrOrderNotFound):
-				writeError(w, http.StatusNotFound, "order not found")
-			case errors.Is(err, engine.ErrOrderNotCancelable):
-				writeError(w, http.StatusConflict, "order is not cancelable")
-			default:
-				writeError(w, http.StatusServiceUnavailable, "cancel failed: "+err.Error())
-			}
+			status, msg := cancelErrorStatus(err)
+			writeError(w, status, msg)
 			return
 		}
 
@@ -192,6 +187,111 @@ func MakeCancelEndpoint(requester CancelRequester) http.Handler {
 			"filled":   report.Filled,
 		})
 	})
+}
+
+// maxBatchCancelOrders caps one batch request so a single caller cannot
+// monopolize the matcher queue with unbounded work.
+const maxBatchCancelOrders = 100
+
+type batchCancelRequest struct {
+	OrderIDs []string `json:"order_ids"`
+	Reason   string   `json:"reason"`
+}
+
+type batchCancelSuccessDTO struct {
+	OrderID string `json:"order_id"`
+	Filled  int64  `json:"filled"`
+}
+
+type batchCancelFailureDTO struct {
+	OrderID string `json:"order_id"`
+	Error   string `json:"error"`
+}
+
+type batchCancelResponse struct {
+	Canceled []batchCancelSuccessDTO `json:"canceled"`
+	Failed   []batchCancelFailureDTO `json:"failed"`
+}
+
+// MakeBatchCancelEndpoint serves POST /api/v1/order/cancel/batch.
+//
+// Orders are canceled one by one in request order. A batch that cancels some
+// orders but not others still returns 200: per-order failures go into
+// "failed", because the caller cannot roll back cancels that already reached
+// the matcher. Only a malformed request (bad JSON, empty or oversized
+// order_ids) is rejected as a whole.
+func MakeBatchCancelEndpoint(requester CancelRequester) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+			return
+		}
+		if requester == nil {
+			writeError(w, http.StatusServiceUnavailable, "matching bus unavailable")
+			return
+		}
+
+		var req batchCancelRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeError(w, http.StatusBadRequest, "invalid json: "+err.Error())
+			return
+		}
+		if len(req.OrderIDs) == 0 {
+			writeError(w, http.StatusBadRequest, "order_ids is empty")
+			return
+		}
+		if len(req.OrderIDs) > maxBatchCancelOrders {
+			writeError(w, http.StatusBadRequest, fmt.Sprintf(
+				"order_ids exceeds %d entries", maxBatchCancelOrders))
+			return
+		}
+
+		resp := batchCancelResponse{
+			Canceled: make([]batchCancelSuccessDTO, 0, len(req.OrderIDs)),
+			Failed:   make([]batchCancelFailureDTO, 0),
+		}
+
+		for _, raw := range req.OrderIDs {
+			orderID, err := strconv.ParseUint(strings.TrimSpace(raw), 10, 64)
+			if err != nil || orderID == 0 {
+				resp.Failed = append(resp.Failed, batchCancelFailureDTO{
+					OrderID: strings.TrimSpace(raw),
+					Error:   "invalid order id",
+				})
+				continue
+			}
+
+			report, err := requester.CancelOrder(r.Context(), orderID, req.Reason)
+			if err != nil {
+				_, msg := cancelErrorStatus(err)
+				resp.Failed = append(resp.Failed, batchCancelFailureDTO{
+					OrderID: strconv.FormatUint(orderID, 10),
+					Error:   msg,
+				})
+				continue
+			}
+
+			resp.Canceled = append(resp.Canceled, batchCancelSuccessDTO{
+				OrderID: strconv.FormatUint(report.OrderID, 10),
+				Filled:  report.Filled,
+			})
+		}
+
+		writeJSON(w, http.StatusOK, resp)
+	})
+}
+
+// cancelErrorStatus maps a cancel failure onto the shared HTTP status and
+// message used by both the single and batch endpoints.
+func cancelErrorStatus(err error) (int, string) {
+	switch {
+	case errors.Is(err, engine.ErrOrderNotFound):
+		return http.StatusNotFound, "order not found"
+	case errors.Is(err, engine.ErrOrderNotCancelable):
+		return http.StatusConflict, "order is not cancelable"
+	default:
+		return http.StatusServiceUnavailable, "cancel failed: " + err.Error()
+	}
 }
 
 func queryAccountID(r *http.Request) (uint64, error) {

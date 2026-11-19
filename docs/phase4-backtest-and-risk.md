@@ -10,25 +10,33 @@ Delivered:
 
 - strategy contract shared by backtest and live execution
   (`internal/hft/strategy`);
+- live single-symbol strategy runtime (`internal/hft/live`) driven by the
+  market-data fanout and submitting through the matching pipeline;
 - deterministic historical replay and simulated execution
-  (`internal/hft/backtest`);
+  (`internal/hft/backtest`), with JSONL and ClickHouse trade sources;
 - fee, slippage and fill-probability models;
 - market-making and statistical-arbitrage sample strategies;
 - performance reporting (equity, drawdown, Sharpe, fill rate, win rate,
   turnover, exposure);
-- intraday risk monitoring with strategy breakers and a position ledger
+- intraday risk monitoring with per-strategy breakers and a position ledger
   (`internal/hft/risk`);
-- risk event publishing to logs, Prometheus and the WebSocket terminal;
+- strategy-tagged orders and execution reports, with per-strategy PnL
+  attribution and `strategy_state` metrics;
+- risk events published to logs, Prometheus, WebSocket and Postgres, plus
+  `GET /api/v1/risk/events`;
+- Web terminal Risk panel fed by the WS `risk` topic and the REST endpoint;
 - `risk_events` Postgres migration.
 
 Not in this phase:
 
-- `POST /api/v1/order/cancel`. The simulator supports cancel, but the gateway
-  does not expose it yet, so live `CANCEL_ONLY` and market-making cancel/replace
-  remain backtest-only;
-- a Postgres writer for risk events (the migration and sink exist, the writer
-  does not);
-- ClickHouse-backed replay (the source interface is ready, the reader is not).
+- multi-symbol live strategies. `stat_arb` remains backtest-only because the
+  gateway matches a single symbol;
+- persisting per-strategy PnL attribution. Account positions are persisted and
+  restored, but restored positions are attributed to `default`;
+- depth-based historical replay. The ClickHouse source replays trades only; a
+  strategy that needs a book needs a depth table first;
+- breakers are scoped per `(account, strategy)` name, not per strategy instance
+  or version.
 
 ## Units
 
@@ -67,6 +75,17 @@ One JSON object per line, monotonically non-decreasing `ts`:
 ```
 
 A sample file lives at `internal/hft/backtest/testdata/sample.jsonl`.
+
+### ClickHouse replay
+
+`backtest.OpenClickHouseSource(ctx, backtest.ClickHouseConfig{...})` implements
+`Source` over the Tick/成交 table (`market.trade_ticks` by default). It streams
+`FORMAT JSONEachRow` rows, converts `ts` with `toUnixTimestamp64Milli`, and
+emits `KindTrade` events. Database and table identifiers are validated, the
+symbol is escaped, and the HTTP call supports basic auth and timeouts.
+
+This source replays trades only, so a book-driven strategy will not see depth
+from it. Use JSONL fixtures with `kind: "book"` for book-based tests.
 
 ### Simulation model
 
@@ -127,6 +146,23 @@ Sample strategies:
 `stat_arb` needs two symbols, which the live gateway does not support yet (it
 rejects symbols other than `matcher.symbol`). It is a backtest strategy today.
 
+### Live runtime
+
+`internal/hft/live` drives the same `Strategy` contract from the live feed:
+
+- it subscribes to `depth:<symbol>`, `tick:<symbol>` and `trade:<symbol>` on the
+  market fanout and seeds its book from the snapshot cache;
+- every strategy order is turned into an engine order tagged with the strategy
+  name, submitted through the `EventBus`, and risk-checked like any other order;
+- `OpenOrders` is scoped to `(account, strategy, symbol)`, so two strategies on
+  one account cannot cancel each other's quotes;
+- `OnTimer` runs on the configured `strategy.timer_seconds`.
+
+Enable it with the `strategy` block in `configs/config.example.yaml`. Live
+strategies require `risk.enabled` (position ledger and breakers) and
+`market.enabled` (book input). Only `market_maker` and `noop` are accepted;
+`stat_arb` fails startup with an explicit error.
+
 ### Report fields
 
 `final_equity`, `realized_pnl`, `unrealized_pnl`, `fees`, `max_drawdown_bps`,
@@ -151,6 +187,13 @@ Metric definitions:
 `risk.Positions` is the authoritative in-memory ledger. The pipeline applies
 every trade report to it on the matching goroutine, before reports are enqueued
 outbound, so positions and risk state survive outbound backpressure.
+
+Each fill also updates a per-strategy attribution keyed by
+`(account, strategy, symbol)`, and maker reports carry the maker's strategy tag.
+This is what lets `max_daily_loss` and `max_drawdown_bps` pause only the
+strategy that lost money. Attribution is in-memory: the persisted snapshot only
+stores account positions, so a restart attributes restored positions to
+`default`.
 
 This fixes two pre-existing gaps:
 
@@ -177,12 +220,15 @@ A breach escalates to `HALT` (manual `Monitor.Reset`) unless `resume_auto` is
 true and `cooldown_seconds > 0`, in which case it becomes a `PAUSE` that resumes
 after the cooldown.
 
+Every check is scoped to `(account, strategy)`: an untagged order uses
+`default`, and one strategy's cancel ratio, open-order cap, daily loss or
+drawdown never pauses another strategy on the same account.
+
 Decision codes: `MAX_OPEN_ORDERS`, `CANCEL_RATIO`, `DAILY_LOSS`, `DRAWDOWN`,
 `STRATEGY_PAUSED`, `STRATEGY_HALTED`, `CANCEL_ONLY`, `RESUMED`.
 
-Open-order accounting is approximate while the cancel API is missing: accepted
-orders are counted and terminal reports release them, but cancels cannot happen
-through the gateway.
+The cancel API (`POST /api/v1/order/cancel`) reports cancellations to the
+monitor, so cancel-ratio accounting is live rather than approximate.
 
 ### Configuration
 
@@ -201,8 +247,11 @@ WebSocket message types: `risk.blocked` (reject/pause/halt/cancel-only),
 `risk.event` (recovery), `risk.snapshot` (recent history on subscribe).
 
 Persistence: `migrations/postgres/000004_risk_events.up.sql` creates
-`risk_events`. The table is not written yet because the Postgres writer is still
-pending.
+`risk_events`; the async sink writes through `postgres.Writer.InsertRiskEvent`
+when Postgres is enabled. History is served by
+`GET /api/v1/risk/events?limit=&account_id=&symbol=&code=&before_id=`, newest
+first, limit default 50 / max 500. Without Postgres the endpoint returns an
+empty page and live events still reach the WebSocket.
 
 ### Metrics
 
@@ -211,6 +260,8 @@ Added, without removing existing series:
 - `trading_system_matching_risk_events_total{code,action}`
 - `trading_system_matching_risk_event_dropped_total`
 - `trading_system_matching_strategy_state{strategy,state}`
+- `trading_system_matching_strategy_orders_total{strategy,result}`
+- `trading_system_matching_strategy_panics_total{strategy}`
 
 Existing `risk_decision_total{code,result}` still records every pre-trade
 decision.
@@ -218,7 +269,7 @@ decision.
 ## Tests
 
 ```sh
-GOCACHE=/tmp/go-build go test ./internal/hft/backtest ./internal/hft/strategy ./internal/hft/risk ./internal/pipeline ./internal/app
+GOCACHE=/tmp/go-build go test ./internal/hft/backtest ./internal/hft/strategy ./internal/hft/live ./internal/hft/risk ./internal/pipeline ./internal/app
 GOCACHE=/tmp/go-build go test ./...
 ```
 
@@ -231,13 +282,22 @@ Covered behaviours:
 - position average cost, realized PnL, flips, marks;
 - cancel-ratio pause and cooldown resume, open-order cap, daily-loss halt,
   drawdown escalation, manual reset;
+- per-strategy isolation: one strategy's open-order or daily-loss breach does
+  not pause another, and PnL is attributed by strategy tag;
+- strategy tag propagation from orders into execution reports;
+- live runner book/tick conversion, tagged submissions, strategy-scoped open
+  orders, and clean start/stop;
+- risk events: Postgres insert/list, HTTP filters and limit clamping;
+- ClickHouse replay parsing, bounds, and error paths;
 - regression: `max_position` is enforced from the real ledger.
 
 ## Follow-ups
 
-1. `POST /api/v1/order/cancel` plus `Matcher.CancelOrder`, which unlocks live
-   market making and makes `CANCEL_ONLY` meaningful.
-2. Postgres writer for `risk_events` (the sink and schema exist).
-3. ClickHouse replay source implementing `backtest.Source`.
-4. Wire strategy runtimes into the live pipeline (orders tagged by strategy so
-   `strategy_state` labels are meaningful).
+1. Persist per-strategy PnL attribution so breakers survive a restart without
+   falling back to `default`.
+2. Multi-symbol live execution, which would make `stat_arb` tradable live.
+3. Depth-based historical replay: add a depth table and a `KindBook` CH source.
+4. Strategy instance identity (version/config hash) if multiple instances of the
+   same strategy must be paused independently.
+5. Exchange-side order reconciliation for the Binance venue (steady-state
+   snapshots beyond the user-data stream).

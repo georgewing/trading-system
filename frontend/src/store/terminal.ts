@@ -10,7 +10,9 @@ import { riskEventKey } from '../lib/risk'
 import { createStore } from './createStore'
 
 export const MAX_TRADES = 60
-export const MAX_KLINES = 500
+// 1500 covers a full 24h of 1m candles, so the chart range selector can show
+// what it promises. Every merge/replace truncates to this bound.
+export const MAX_KLINES = 1500
 export const MAX_ORDERS = 200
 export const MAX_RISK_EVENTS = 200
 

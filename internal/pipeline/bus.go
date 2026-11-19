@@ -312,6 +312,7 @@ func (b *EventBus) publishResult(ctx context.Context, cmd OrderCommand, result e
 		if makerReported {
 			report.MakerReported = true
 		}
+		b.assignReportIdentity(&report)
 		// Account for fills before enqueueing: outbound enqueue can drop under
 		// backpressure, but positions and risk state must not.
 		if b.riskObserver != nil {

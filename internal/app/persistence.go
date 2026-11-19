@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"fmt"
+	"log"
 	"os"
 	"time"
 
@@ -11,6 +12,7 @@ import (
 	"trading-system/internal/pipeline"
 	"trading-system/internal/storage/clickhouse"
 	"trading-system/internal/storage/postgres"
+	tradinghttp "trading-system/internal/transport/http"
 )
 
 // newPersistenceSinks builds the optional durable sinks. The returned
@@ -123,6 +125,29 @@ func persistPositions(ctx context.Context, w *postgres.Writer, positions *risk.P
 		})
 	}
 	return w.UpsertPositions(ctx, batch)
+}
+
+// positionSnapshotLoop persists a periodic snapshot so a crash loses at most one
+// interval of position changes. A final snapshot is still written on shutdown.
+func positionSnapshotLoop(ctx context.Context, w *postgres.Writer, positions *risk.Positions, interval time.Duration) {
+	if interval <= 0 {
+		interval = 5 * time.Second
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			saveCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			if err := persistPositions(saveCtx, w, positions); err != nil {
+				log.Printf("periodic position snapshot failed: %v", err)
+			}
+			cancel()
+		}
+	}
 }
 
 type pgExecSink struct {
@@ -254,3 +279,70 @@ var (
 	_ pipeline.ExecReportSink = (*pgExecSink)(nil)
 	_ pipeline.ExecReportSink = (*chTradeSink)(nil)
 )
+
+// pgRiskSink persists risk events. It implements risk.Sink and is wrapped by
+// risk.AsyncSink, so a slow database never blocks the matching goroutine.
+type pgRiskSink struct {
+	writer *postgres.Writer
+}
+
+func newPGRiskSink(w *postgres.Writer) *pgRiskSink { return &pgRiskSink{writer: w} }
+
+func (s *pgRiskSink) Record(ev risk.Event) {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	ts := time.UnixMilli(ev.TS)
+	if ev.TS == 0 {
+		ts = time.Now()
+	}
+	err := s.writer.InsertRiskEvent(ctx, postgres.RiskEvent{
+		TS:        ts,
+		AccountID: ev.AccountID,
+		Symbol:    ev.Symbol,
+		Strategy:  ev.Strategy,
+		OrderID:   ev.OrderID,
+		Code:      ev.Code,
+		Action:    string(ev.Action),
+		Message:   ev.Message,
+	})
+	if err != nil {
+		log.Printf("persist risk event failed: %v", err)
+	}
+}
+
+// riskEventLister adapts the Postgres reader to the HTTP endpoint contract. A
+// nil writer yields a nil lister, which the endpoint renders as an empty page.
+func riskEventLister(w *postgres.Writer) tradinghttp.RiskEventLister {
+	if w == nil {
+		return nil
+	}
+	return func(ctx context.Context, f tradinghttp.RiskEventFilter) ([]tradinghttp.RiskEventRecord, error) {
+		rows, err := w.ListRiskEvents(ctx, postgres.RiskEventQuery{
+			Limit:     f.Limit,
+			AccountID: f.AccountID,
+			Symbol:    f.Symbol,
+			Code:      f.Code,
+			BeforeID:  f.BeforeID,
+		})
+		if err != nil {
+			return nil, err
+		}
+
+		out := make([]tradinghttp.RiskEventRecord, 0, len(rows))
+		for _, row := range rows {
+			out = append(out, tradinghttp.RiskEventRecord{
+				ID:        row.ID,
+				TS:        row.TS.UnixMilli(),
+				AccountID: row.AccountID,
+				Symbol:    row.Symbol,
+				Strategy:  row.Strategy,
+				OrderID:   row.OrderID,
+				Code:      row.Code,
+				Action:    row.Action,
+				Message:   row.Message,
+			})
+		}
+		return out, nil
+	}
+}
