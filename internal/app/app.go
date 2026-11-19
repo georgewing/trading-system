@@ -286,6 +286,8 @@ func Run(ctx context.Context, cfg *Config) error {
 
 	bus.Start(pipelineCtx)
 
+	book := orders.NewBook(10000)
+
 	liveRunner, err := startLiveStrategy(pipelineCtx, cfg, live.Deps{
 		Bus:               bus,
 		Matcher:           matcher,
@@ -294,6 +296,7 @@ func Run(ctx context.Context, cfg *Config) error {
 		Snapshot:          plane.snapshotter(),
 		Metrics:           metrics,
 		QuantityPrecision: cfg.Matcher.QuantityPrecision,
+		OnOrder:           book.AddOrder,
 	})
 	if err != nil {
 		pipelineCancel()
@@ -308,8 +311,6 @@ func Run(ctx context.Context, cfg *Config) error {
 		_ = metricsLn.Close()
 		return err
 	}
-
-	book := orders.NewBook(10000)
 
 	externalCtx, externalCancel := context.WithCancel(context.Background())
 

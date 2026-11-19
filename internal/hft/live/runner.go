@@ -35,6 +35,9 @@ type Deps struct {
 	AccountID         uint64
 	Symbol            string
 	QuantityPrecision int
+	// OnOrder, when set, observes every accepted strategy order so the order read
+	// model can show strategy orders the same way it shows HTTP orders.
+	OnOrder func(engine.Order)
 	// Timer is the OnTimer cadence, default 5s.
 	Timer time.Duration
 	// SubmitTimeout bounds one order round trip to the matching goroutine,
@@ -308,6 +311,7 @@ func (c *runnerContext) submit(ctx context.Context, req strategy.OrderRequest) (
 		Quantity:  wire.Decimal(req.Qty, c.deps.QuantityPrecision),
 		CreatedAt: time.Now().UnixNano(),
 	}
+	order.ClientOrderID = fmt.Sprintf("%s-%d", strategyName, order.ID)
 
 	resultCh := make(chan pipeline.MatchResult, 1)
 	if err := c.deps.Bus.SubmitWithContext(ctx, pipeline.OrderCommand{
@@ -315,6 +319,10 @@ func (c *runnerContext) submit(ctx context.Context, req strategy.OrderRequest) (
 		ResultCh: resultCh,
 	}); err != nil {
 		return strategy.SubmitResult{}, err
+	}
+
+	if c.deps.OnOrder != nil {
+		c.deps.OnOrder(order)
 	}
 
 	select {

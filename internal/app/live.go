@@ -70,9 +70,19 @@ func startLiveStrategy(ctx context.Context, cfg *Config, deps live.Deps) (*live.
 	deps.Timer = timer
 	deps.SubmitTimeout = submitTimeout
 
+	// strategy.symbol is the single source of truth for the instrument; inject it
+	// into params so strategies that take a symbol do not need it duplicated.
+	params := make(map[string]string, len(s.Params)+1)
+	for key, value := range s.Params {
+		params[key] = value
+	}
+	if params["symbol"] == "" {
+		params["symbol"] = symbol
+	}
+
 	return live.Start(ctx, deps, live.Config{
 		Strategy: strat,
-		Params:   s.Params,
+		Params:   params,
 		Runner: strategy.RunnerConfig{
 			MaxOrderRate:  s.MaxOrderRate,
 			MaxOpenOrders: s.MaxOpenOrders,

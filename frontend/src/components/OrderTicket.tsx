@@ -24,11 +24,13 @@ export function OrderTicket() {
   const meta = useStore(metaStore)
   const trades = useStore(tradesStore)
 
-  const [side, setSide] = useState<Side>('BUY')
-  const [type, setType] = useState<OrderType>('LIMIT')
-  const [tif, setTif] = useState<TIF>('GTC')
-  const [price, setPrice] = useState('')
-  const [quantity, setQuantity] = useState('0.001')
+  	const [side, setSide] = useState<Side>('BUY')
+  	const [type, setType] = useState<OrderType>('LIMIT')
+  	const [tif, setTif] = useState<TIF>('GTC')
+  	const [accountId, setAccountId] = useState('1')
+  	const [strategy, setStrategy] = useState('manual')
+  	const [price, setPrice] = useState('')
+  	const [quantity, setQuantity] = useState('0.001')
   const [busy, setBusy] = useState(false)
   const [notice, setNotice] = useState<Notice | null>(null)
 
@@ -57,9 +59,11 @@ export function OrderTicket() {
 
     setBusy(true)
     try {
-      const res = await submitOrder({
-        order_id: `web-${Date.now()}`,
-        symbol: meta.symbol,
+      			const res = await submitOrder({
+        				order_id: `web-${Date.now()}`,
+        				account_id: Number(accountId) || 0,
+        				strategy: strategy.trim() || undefined,
+        				symbol: meta.symbol,
         side,
         price: ticks,
         quantity,
@@ -102,8 +106,27 @@ export function OrderTicket() {
           </button>
         </div>
 
-        <label className="field">
-          <span>Type</span>
+        		<label className="field">
+        		  <span>Account</span>
+        		  <input
+        			value={accountId}
+        			onChange={(e) => setAccountId(e.target.value)}
+        			inputMode="numeric"
+        			placeholder="1"
+        		  />
+        		</label>
+
+        		<label className="field">
+        		  <span>Strategy</span>
+        		  <input
+        			value={strategy}
+        			onChange={(e) => setStrategy(e.target.value)}
+        			placeholder="manual"
+        		  />
+        		</label>
+
+        		<label className="field">
+        		  <span>Type</span>
           <select
             value={type}
             onChange={(e) => setType(e.target.value as OrderType)}

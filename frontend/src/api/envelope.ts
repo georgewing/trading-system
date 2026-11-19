@@ -142,6 +142,7 @@ export interface OrdersResponse {
 export interface SubmitOrderRequest {
   order_id: string
   account_id?: number
+  strategy?: string
   symbol?: string
   side: TradeSide
   price: number

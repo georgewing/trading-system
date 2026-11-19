@@ -1,0 +1,89 @@
+# Local demo configuration.
+#
+# It enables the live Binance market feed, the risk stage and the single-symbol
+# market-making strategy on the internal paper venue. The frontend dev server
+# proxies /api and /ws to :8090, so `npm run dev` in frontend/ is the only other
+# process needed.
+#
+# Accounts:
+#   - 1: manual orders from the web order ticket
+#   - 9: the market_maker strategy
+# Keeping them separate makes positions readable in the UI.
+#
+# Run:
+#   SNOWFLAKE_WORKER_ID=1 go run ./cmd/hft-server -config ./configs/config.demo.yaml
+
+server:
+  api_addr: ":8090"
+  metrics_addr: ":9090"
+
+matcher:
+  symbol: "BTCUSDT"
+  price_precision: 8
+  quantity_precision: 8
+
+market:
+  enabled: true
+  provider: "binance"
+  ws_url: "wss://stream.binance.com:9443"
+  symbol: "BTCUSDT"
+  depth_levels: 20
+  depth_speed: "100ms"
+  kline_interval: "1m"
+  reconnect_min_seconds: 1
+  reconnect_max_seconds: 30
+  store_trade_cap: 200
+  store_kline_cap: 1000
+
+pipeline:
+  inbound_capacity: 1048576
+  outbound_capacity: 1048576
+
+routing:
+  default_venue: "paper"
+  symbol_venues: {}
+
+risk:
+  enabled: true
+  symbol_whitelist: ["BTCUSDT"]
+  max_order_qty: 0
+  max_notional: 0
+  # 500 bps around the live mid: orders far from the market are rejected.
+  price_band_bps: 500
+  max_orders_per_window: 0
+  window_seconds: 0
+  max_position: 0
+
+  intraday:
+    max_cancel_ratio_bps: 0
+    cancel_window_seconds: 0
+    min_cancel_samples: 5
+    # 8 covers the strategy's two quotes plus manual orders.
+    max_open_orders: 8
+    max_daily_loss: 0
+    max_drawdown_bps: 0
+    cooldown_seconds: 0
+    resume_auto: false
+
+strategy:
+  enabled: true
+  name: "market_maker"
+  account_id: 9
+  symbol: ""                 # empty falls back to matcher.symbol
+  timer_seconds: 5
+  submit_timeout_millis: 2000
+  max_order_rate: 10
+  max_open_orders: 2
+  max_panics: 3
+  params:
+    half_spread_bps: "5"
+    order_qty: "100000"      # lots: 0.001 BTC at quantity_precision 8
+    inventory_limit: "1000000"
+    min_requote_bps: "1"
+
+storage:
+  postgres_enabled: false
+  postgres_dsn: ""
+
+websocket:
+  buffer_size: 1024
