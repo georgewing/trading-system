@@ -9,9 +9,9 @@
 |---|---|---|---|
 | L0 领域 | `internal/hft/domain` | 行情/订单的实体与端口（`Event`/`Trade`/`Tick`/`Depth`/`Kline`、`Source`/`Sink`/`Fanout`/`Snapshotter`） | 仅标准库 |
 | L0 领域 | `internal/hft/engine` | 订单簿、撮合、订单/成交类型 | `internal/infrastructure/datastructures`、`pkg/*` |
-| L0 领域 | `internal/hft/risk`、`internal/hft/strategy` | 风控规则、策略接口 | `internal/hft/engine` |
+| L0 领域 | `internal/hft/risk`、`internal/strategy` | 风控规则、策略接口 | `internal/hft/engine` |
 | L1 应用 | `internal/pipeline` | 订单命令编排：风控 → 撮合 → 执行回报 | 领域层 + 端口 |
-| L2 适配器 | `internal/hft/infra/binance` | 行情接入（解码 + dialer + 重连） | `hft/domain`、`hft/engine` |
+| L2 适配器 | `internal/gateway/binance/market` | 行情接入（解码 + dialer + 重连） | `hft/domain`、`hft/engine` |
 | L2 适配器 | `internal/hft/infra/memstore` | 行情快照（读侧） | `hft/domain` |
 | L2 适配器 | `internal/hft/infra/orders` | 订单读模型 | `hft/engine` |
 | L2 适配器 | `internal/storage/{clickhouse,postgres}` | 持久化 writer | 标准库/驱动 |
@@ -25,19 +25,19 @@
 1. **`internal/hft/domain` 零内部依赖**。任何 `trading-system/internal/...` 的 import 都不允许。
 2. **依赖只能向内**：L2/L3 不得被 L0/L1 依赖；`pipeline` 不得 import `transport`、`app`、`infra`。
 3. **端口在领域层，实现的选取在组合根**：`pipeline` 只依赖接口（`RiskGuard`、`Matcher`、`Recorder`），具体类型由 `app` 注入。
-4. **交付层不直接访问持久化/网络适配器**：`transport/*` 只能读端口与读模型，不能 import `storage/*`、`infra/binance`。
+4. **交付层不直接访问持久化/网络适配器**：`transport/*` 只能读端口与读模型，不能 import `storage/*`、`gateway/binance/market`。
 5. **同一职责只有一份实现**：新增实现前先查第 4 节的重复清单。
 
 ## 3. 当前依赖图（关键边）
 
 ```
 cmd/hft-server      → app
-cmd/backtest        → hft/backtest, hft/strategy
+cmd/backtest        → backtest, strategy
 app                 → 所有层（组合根，允许）
 transport/http      → domain, engine, infra/orders, pipeline, wire
 transport/ws        → domain, engine, infra/orders, pipeline, wire, observability
 pipeline            → engine, execution, risk, observability
-infra/binance       → domain, engine
+gateway/binance/market → domain, engine
 infra/memstore      → domain
 infra/orders        → engine
 domain              → （无）

@@ -5,7 +5,7 @@ import (
 	"math"
 	"testing"
 
-	"trading-system/internal/hft/strategy"
+	"trading-system/internal/strategy"
 )
 
 // TestSampleReplayAccountingIdentity replays the bundled sample through the

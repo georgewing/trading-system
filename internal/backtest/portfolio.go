@@ -2,7 +2,7 @@ package backtest
 
 import (
 	"trading-system/internal/hft/engine"
-	"trading-system/internal/hft/strategy"
+	"trading-system/internal/strategy"
 )
 
 // EquityPoint is one mark-to-market observation.

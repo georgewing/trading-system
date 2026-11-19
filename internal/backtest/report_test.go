@@ -6,7 +6,7 @@ import (
 	"testing"
 
 	"trading-system/internal/hft/engine"
-	"trading-system/internal/hft/strategy"
+	"trading-system/internal/strategy"
 )
 
 // fillAt builds a zero-fee fill for portfolio tests.

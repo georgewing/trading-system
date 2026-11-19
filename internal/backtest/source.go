@@ -7,7 +7,7 @@ import (
 	"fmt"
 	"os"
 
-	"trading-system/internal/hft/strategy"
+	"trading-system/internal/strategy"
 )
 
 // Source is a monotonic replay stream. Next returns false when the stream is

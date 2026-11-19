@@ -16,7 +16,7 @@
 //   - the venue has no rejection other than the simulation's own limits.
 package backtest
 
-import "trading-system/internal/hft/strategy"
+import "trading-system/internal/strategy"
 
 // Kind identifies an event in the replay stream.
 type Kind uint8

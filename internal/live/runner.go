@@ -17,8 +17,8 @@ import (
 	"trading-system/internal/hft/domain"
 	"trading-system/internal/hft/engine"
 	"trading-system/internal/hft/risk"
-	"trading-system/internal/hft/strategy"
 	"trading-system/internal/pipeline"
+	"trading-system/internal/strategy"
 	"trading-system/internal/transport/wire"
 	"trading-system/pkg/idgen"
 )

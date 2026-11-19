@@ -6,7 +6,7 @@ import (
 	"math/rand"
 
 	"trading-system/internal/hft/engine"
-	"trading-system/internal/hft/strategy"
+	"trading-system/internal/strategy"
 )
 
 // Errors returned by the simulator.

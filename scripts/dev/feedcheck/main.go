@@ -14,8 +14,8 @@ import (
 	"syscall"
 	"time"
 
+	"trading-system/internal/gateway/binance/market"
 	"trading-system/internal/hft/domain"
-	"trading-system/internal/hft/infra/binance"
 	"trading-system/internal/hft/infra/memstore"
 )
 

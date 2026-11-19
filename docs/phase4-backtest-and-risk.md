@@ -9,11 +9,11 @@ configuration surface, and the operational follow-ups.
 Delivered:
 
 - strategy contract shared by backtest and live execution
-  (`internal/hft/strategy`);
-- live single-symbol strategy runtime (`internal/hft/live`) driven by the
+  (`internal/strategy`);
+- live single-symbol strategy runtime (`internal/live`) driven by the
   market-data fanout and submitting through the matching pipeline;
 - deterministic historical replay and simulated execution
-  (`internal/hft/backtest`), with JSONL and ClickHouse trade sources;
+  (`internal/backtest`), with JSONL and ClickHouse trade sources;
 - fee, slippage and fill-probability models;
 - market-making and statistical-arbitrage sample strategies;
 - performance reporting (equity, drawdown, Sharpe, fill rate, win rate,
@@ -74,7 +74,7 @@ One JSON object per line, monotonically non-decreasing `ts`:
 {"ts":1700000030000,"symbol":"BTCUSDT","kind":"trade","trade":{"id":1,"price":9997,"qty":100000000}}
 ```
 
-A sample file lives at `internal/hft/backtest/testdata/sample.jsonl`.
+A sample file lives at `internal/backtest/testdata/sample.jsonl`.
 
 ### ClickHouse replay
 
@@ -125,7 +125,7 @@ order-id creation order, so map iteration order cannot change results.
 
 ### Strategy contract
 
-`internal/hft/strategy.Strategy` receives:
+`internal/strategy.Strategy` receives:
 
 - `OnBook(BookView)`: a depth snapshot;
 - `OnTrade(TradeView)`: a public print;
@@ -148,7 +148,7 @@ rejects symbols other than `matcher.symbol`). It is a backtest strategy today.
 
 ### Live runtime
 
-`internal/hft/live` drives the same `Strategy` contract from the live feed:
+`internal/live` drives the same `Strategy` contract from the live feed:
 
 - it subscribes to `depth:<symbol>`, `tick:<symbol>` and `trade:<symbol>` on the
   market fanout and seeds its book from the snapshot cache;
@@ -269,7 +269,7 @@ decision.
 ## Tests
 
 ```sh
-GOCACHE=/tmp/go-build go test ./internal/hft/backtest ./internal/hft/strategy ./internal/hft/live ./internal/hft/risk ./internal/pipeline ./internal/app
+GOCACHE=/tmp/go-build go test ./internal/backtest ./internal/strategy ./internal/live ./internal/hft/risk ./internal/pipeline ./internal/app
 GOCACHE=/tmp/go-build go test ./...
 ```
 

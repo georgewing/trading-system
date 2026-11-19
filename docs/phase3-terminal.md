@@ -7,7 +7,7 @@ Status: vertical slice running end-to-end with real Binance market data.
 | Layer | Package | Notes |
 |---|---|---|
 | Domain contract | `internal/hft/domain` | Event/Kind, Source/Sink/Fanout/Snapshotter ports, MemFanout |
-| Binance adapter | `internal/hft/infra/binance` | pure decoder + injectable `Dialer` (coder/websocket) |
+| Binance adapter | `internal/gateway/binance/market` | pure decoder + injectable `Dialer` (coder/websocket) |
 | Snapshot adapter | `internal/hft/infra/memstore` | bounded depth/trades/klines read model |
 | Order read model | `internal/orders` | submission + latest execution state |
 | WS transport | `internal/transport/ws` | `/ws`, topics, seq, snapshots |

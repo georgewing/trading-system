@@ -5,8 +5,8 @@ import (
 	"fmt"
 	"time"
 
-	"trading-system/internal/hft/live"
-	"trading-system/internal/hft/strategy"
+	"trading-system/internal/live"
+	"trading-system/internal/strategy"
 )
 
 // newLiveStrategy builds a strategy supported by the single-symbol gateway.
