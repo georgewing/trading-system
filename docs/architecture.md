@@ -1,6 +1,6 @@
 # 架构与依赖规则
 
-本文件定义 `internal/hft` 布局下的分层与依赖方向，是判断"改得干不干净"的唯一标准。
+本文件定义当前交易系统的分层与依赖方向。`internal/hft` 只承载交易核心域；策略、回测、实盘编排和交易所适配器保持在它外部。
 新增/搬迁包时按第 2 节规则校验，命令见第 6 节。
 
 ## 1. 分层与目录
@@ -19,6 +19,10 @@
 | L2 适配器 | `internal/execution`、`internal/routing` | venue 抽象与路由 | `hft/engine` |
 | L3 交付 | `internal/transport/{http,ws,wire}` | HTTP/WS 适配、wire 编码 | 应用层 + 领域层 |
 | L4 组装 | `internal/app` | 组合根：读配置、构造适配器、生命周期 | 所有层 |
+
+当前交易核心域为 `internal/hft/{domain,engine,risk,infra}`。策略、回测、实盘编排分别在
+`internal/strategy`、`internal/backtest`、`internal/live`；Binance 行情与执行适配器在
+`internal/gateway/binance/{market,execution}`。
 
 ## 2. 依赖规则（违反即为脏）
 
@@ -47,12 +51,12 @@ domain              → （无）
 
 | 项 | 现状 | 目标 | 说明 |
 |---|---|---|---|
-| `internal/transport/*` | L3 在顶层 | `internal/hft/api`（空占位已建） | 迁移时注意 `http`/`ws` 两个包的符号重名，需一次性合并或分层保留 |
-| `internal/app` | 组合根在顶层 | `internal/hft/bootstrap`（空占位已建） | 纯搬迁 |
-| `internal/storage/*` | L2 在顶层 | `internal/hft/infra/*` | 纯搬迁 |
-| `internal/infrastructure/datastructures` | 被 `hft/engine` 依赖 | `internal/hft/infra/datastructures` 或 `hft/engine/datastructures` | 纯搬迁 |
-| `internal/observability` | 端口与 Prometheus 实现同包 | 端口留领域层，实现进 `hft/infra` | **需拆包**，不是搬迁 |
-| `internal/execution` | 端口（`Venue`/`Matcher`）与 `PaperVenue` 实现同包 | 端口进应用/领域层，实现进 `hft/infra` | **需拆包** |
+| `internal/transport/*` | L3 在顶层 | 保持顶层 | 协议适配不属于交易核心域；`internal/hft/api` 不再作为目标 |
+| `internal/app` | 组合根在顶层 | 保持顶层 | composition root 不进入 hft；`internal/hft/bootstrap` 不再作为目标 |
+| `internal/storage/*` | L2 在顶层 | 保持顶层 | 存储是外部适配器；不迁入 `internal/hft/infra` |
+| `internal/infrastructure/datastructures` | 被 `hft/engine` 依赖 | 可保留顶层，或后续移入 `hft/engine` | 纯搬迁，优先级低 |
+| `internal/observability` | 端口与 Prometheus 实现同包 | 端口留领域层，实现保持适配器层 | **需拆包**，不是搬迁 |
+| `internal/execution` | 端口（`Venue`/`Matcher`）与 `PaperVenue` 实现同包 | 保持顶层，或后续拆分端口/实现 | 不迁入 `internal/hft/infra` |
 | `internal/pipeline` | 依赖具体 `risk`/`execution` 类型 | 收敛到端口 | 逐步替换，勿一次性改 |
 
 ## 5. 两条不能踩的边界
@@ -66,7 +70,7 @@ domain              → （无）
 
 ```sh
 GOCACHE=/tmp/go-build go build ./...
-GOCACHE=/tmp/go-build go test -race ./internal/hft/...
+GOCACHE=/tmp/go-build go test -race ./...
 
 # 依赖方向检查：domain 必须没有任何 internal 依赖
 GOCACHE=/tmp/go-build go list -f '{{.ImportPath}} -> {{join .Imports " "}}' ./... \

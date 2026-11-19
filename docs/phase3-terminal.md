@@ -144,9 +144,9 @@ or storage without touching the transports:
 
 - **Ports** (`internal/hft/domain`): `Source` (streams events), `Fanout`
   (broadcast), `Snapshotter` (state), `Sink` (persistence).
-- **Adapters**: `infra/binance` implements `Source` and owns decoding plus the
-  injectable `Dialer`; `infra/memstore` implements `Snapshotter`; the WS and
-  HTTP transports are pure adapters over those ports.
+- **Adapters**: `gateway/binance/market` implements `Source` and owns decoding
+  plus the injectable `Dialer`; `hft/infra/memstore` implements `Snapshotter`;
+  the WS and HTTP transports are pure adapters over those ports.
 - **Wiring** (`internal/app`): a Binance source feeds the memstore and the
   fan-out from one emit callback, so the read model and the live stream can
   never disagree about what arrived.
@@ -161,4 +161,4 @@ Price representation is deliberately split:
 Earlier in this branch there were two competing market-data packages
 (`internal/market` + `internal/gateway/binance` alongside `internal/hft/...`).
 They have been consolidated onto this one: the duplicate packages are gone, and
-their useful regression tests moved into `infra/binance`.
+their useful regression tests moved into `gateway/binance/market`.
